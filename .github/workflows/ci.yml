@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test & lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          python3 -m pip install --upgrade pytest
+
+      - name: Syntax check (py_compile)
+        run: python3 -m py_compile wayport
+
+      - name: Run pytest suite
+        run: pytest -v tests/
+
+      - name: Shellcheck install.sh and embedded guest wrapper
+        run: |
+          shellcheck install.sh
+          python3 - <<'EOF' | shellcheck -s bash -
+          import importlib.machinery, importlib.util, sys
+          loader = importlib.machinery.SourceFileLoader("wayport", "wayport")
+          spec = importlib.util.spec_from_loader("wayport", loader)
+          mod = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = mod
+          loader.exec_module(mod)
+          print(mod.render_guest_wrapper())
+          EOF

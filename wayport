@@ -1,0 +1,4398 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""
+wayport: Seamless Remote & KVM Guest Application Exporter, Runner,
+System Tray & Desktop Notification Bridge for KDE Plasma 6 (Wayland).
+
+Copyright (C) 2026 Valentyn Berezhnyi
+Licensed under the GNU General Public License v3.0 or later.
+
+Transport Modes:
+----------------
+1. `hybrid` (default):
+   Control plane over SSH (`BatchMode=yes`), Wayland & Tray/Notification data
+   plane over native kernel `AF_VSOCK` (`vhost-vsock`). Zero guest daemon setup.
+2. `vsock` (alias: `socket`):
+   100% `AF_VSOCK` control plane (JSON-RPC to guest `wayport-daemon`) and data
+   plane. Requires no SSH daemon or virtual network interface inside the VM.
+3. `ssh`:
+   100% SSH control plane + `ssh -R` Unix-socket Waypipe tunnel + SSH stdio
+   System Tray / Notifications bridge. Requires no `vhost-vsock` (works with
+   remote Linux hosts, containers, or VMs without Virtio VSOCK).
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+__version__ = "0.2.1"
+
+# ==============================================================================
+# 0. USER CONFIGURATION
+#    Edit defaults below, or override via WAYPORT_* env vars / CLI flags.
+#    Any change here automatically updates the guest script hash & re-deploys.
+# ==============================================================================
+
+# Transport mode: "hybrid" | "vsock" (alias "socket") | "ssh"
+DEFAULT_TRANSPORT_MODE: str = "hybrid"
+
+# Default target (optional; can be omitted here and passed via -t/--target or --cid)
+DEFAULT_TARGET: str = ""
+DEFAULT_VSOCK_CID: int | None = None
+
+# AF_VSOCK ports (used in "hybrid" and "vsock" modes)
+VSOCK_CONTROL_PORT: int = 5000
+VSOCK_TRAY_PORT: int = 5001
+VSOCK_APP_PORT_MIN: int = 5100
+VSOCK_APP_PORT_MAX: int = 5999
+ALLOW_VSOCK_SCRIPT_SYNC: bool = True
+
+# Socket stream bridge settings
+STREAM_CHUNK_SIZE: int = 262144  # 256 KiB
+
+# Waypipe transport defaults per mode ("none", "lz4", "zstd")
+WAYPIPE_COMPRESSION_VSOCK: str = "none"
+WAYPIPE_COMPRESSION_SSH: str = "lz4"
+WAYPIPE_NO_GPU_VSOCK: bool = True
+WAYPIPE_NO_GPU_SSH: bool = True
+MASK_IDLE_INHIBIT: bool = True  # Masks zwp_idle_inhibit_manager_v1 (active when compression == "none")
+
+# SSH options (used in "hybrid" and "ssh" modes)
+SSH_CONNECT_TIMEOUT: int = 10
+SSH_SERVER_ALIVE_INTERVAL: int = 15
+SSH_SERVER_ALIVE_COUNT_MAX: int = 3
+SSH_EXTRA_OPTIONS: tuple[str, ...] = ()
+
+# Guest wrapper & runtime behaviour
+GUEST_BIN_DIR: str = "~/.local/bin"
+GUEST_LOCALE: str = "C.UTF-8"
+ENABLE_PORTAL_ROUTING: bool = True      # Route KDE KFileWidget dialogs to host
+ENABLE_SINGLETON_TAKEOVER: bool = True  # Terminate conflicting local-only VM app instance
+VULKAN_USE_LVP: bool = True             # Force Lavapipe ICD inside KVM guest
+FAST_FORK_THRESHOLD_SEC: int = 3        # Keepalive threshold for fast-forking launchers
+
+# System Tray & Desktop Notifications bridge
+AUTO_START_TRAY_ON_RUN: bool = True
+TRAY_RECONNECT_DELAY_SEC: float = 3.0
+TRAY_ACCEPT_TIMEOUT_SEC: float = 10.0
+TRAY_SCAN_INTERVAL_MS: int = 2000
+TRAY_QUIT_WATCHDOG_DELAY_SEC: float = 0.8
+TRAY_QUIT_WINDOW_SEC: float = 5.0       # Run quit watchdog only within N sec after a MenuEvent
+TRAY_ICON_SIZE: int = 48
+TRAY_MAX_ICON_BYTES: int = 524288       # 512 KiB per icon file
+TRAY_MAX_THEME_FILES: int = 32          # Max icon files collected from a custom IconThemePath
+IGNORED_GUEST_PROCS: frozenset[str] = frozenset({
+    "plasmashell",
+    "kded6",
+    "kded5",
+    "discovernotifier",
+    "kalendarac",
+    "kdeconnectd",
+    "org_kde_powerdevil",
+    "polkit-kde-authentication-agent-1",
+    "xdg-desktop-portal-kde",
+    "kaccess",
+    "klipper",
+    "kmix",
+    "kwalletd6",
+    "ibus-ui-gtk3",
+    "fcitx5",
+})
+IGNORED_TRAY_IDS: frozenset[str] = frozenset({
+    "discover notifier",
+    "kalendarac",
+    "kdeconnect",
+    "klipper",
+})
+
+# Chromium / Electron executables requiring explicit Wayland & KWallet6 CLI flags
+CHROMIUM_BINARIES: tuple[str, ...] = (
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+    "brave-browser",
+    "microsoft-edge",
+    "vivaldi",
+    "claude-desktop",
+    "claude",
+    "antigravity",
+    "code",
+    "codium",
+    "cursor",
+    "windsurf",
+    "qoder",
+    "trae",
+    "kiro",
+    "obsidian",
+    "slack",
+    "discord",
+)
+CHROMIUM_EXTRA_FLAGS: tuple[str, ...] = (
+    "--ozone-platform=wayland",
+    "--password-store=kwallet6",
+)
+# Also auto-detect any Electron/Chromium app inside the guest by checking its install dir
+AUTO_DETECT_ELECTRON: bool = True
+# Electron apps that use BrowserWindow({show:false}) + ready-to-show without fallback
+# and deadlock on Wayland wl_shm (--no-gpu) until nudged via their single-instance handler
+ELECTRON_SHM_NUDGE_APPS: tuple[str, ...] = (
+    "qoder",
+)
+ELECTRON_SHM_NUDGE_DELAY_SEC: float = 2.5
+
+# XDG search paths inside the guest (ordered by precedence: highest priority first)
+DESKTOP_APP_SEARCH_DIRS: tuple[str, ...] = (
+    "~/.local/share/applications",
+    "~/.local/share/flatpak/exports/share/applications",
+    "/var/lib/flatpak/exports/share/applications",
+    "/usr/local/share/applications",
+    "/usr/share/applications",
+    "/var/lib/snapd/desktop/applications",
+)
+ICON_SEARCH_DIRS: tuple[str, ...] = (
+    "~/.local/share/icons/hicolor/scalable/apps",
+    "~/.local/share/icons/hicolor/256x256/apps",
+    "~/.local/share/icons/hicolor/128x128/apps",
+    "~/.local/share/icons/hicolor/64x64/apps",
+    "~/.local/share/icons/hicolor/48x48/apps",
+    "/var/lib/flatpak/exports/share/icons/hicolor/scalable/apps",
+    "/var/lib/flatpak/exports/share/icons/hicolor/256x256/apps",
+    "/var/lib/flatpak/exports/share/icons/hicolor/128x128/apps",
+    "/usr/share/icons/hicolor/scalable/apps",
+    "/usr/share/icons/hicolor/512x512/apps",
+    "/usr/share/icons/hicolor/256x256/apps",
+    "/usr/share/icons/hicolor/128x128/apps",
+    "/usr/share/icons/hicolor/64x64/apps",
+    "/usr/share/icons/hicolor/48x48/apps",
+    "/usr/share/icons/breeze/apps/48",
+    "/usr/share/pixmaps",
+)
+
+# Host XDG directories & launcher badge format
+HOST_APPS_DIR: Path = Path.home() / ".local" / "share" / "applications"
+HOST_ICONS_DIR: Path = Path.home() / ".local" / "share" / "icons" / "wayport"
+HOST_CACHE_DIR: Path = Path.home() / ".cache" / "wayport"
+HOST_TRAY_ICONS_DIR: Path = HOST_CACHE_DIR / "tray-icons"
+HOST_SYSTEMD_USER_DIR: Path = Path.home() / ".config" / "systemd" / "user"
+DESKTOP_BADGE_FORMAT: str = "{name} [{vm}]"
+
+# ==============================================================================
+# Internal Constants (normally do not require user modification)
+# ==============================================================================
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
+
+SCRIPT_ABS_PATH = str(Path(__file__).resolve())
+
+VMADDR_CID_ANY = getattr(socket, "VMADDR_CID_ANY", 0xFFFFFFFF)
+VMADDR_CID_LOCAL = getattr(socket, "VMADDR_CID_LOCAL", 1)
+VMADDR_CID_HOST = getattr(socket, "VMADDR_CID_HOST", 2)
+
+IDLE_INHIBIT_NEEDLE = b"zwp_idle_inhibit_manager_v1"
+IDLE_INHIBIT_REPLACEMENT = b"zwp_idle_inhibit_disabledv1"
+assert len(IDLE_INHIBIT_NEEDLE) == len(IDLE_INHIBIT_REPLACEMENT)
+
+VALID_MODES = ("hybrid", "vsock", "ssh")
+MODE_ALIASES = {"socket": "vsock"}
+VALID_COMPRESSIONS = ("none", "lz4", "zstd")
+
+GUEST_WRAPPER_NAME = "wayport-wrapper"
+GUEST_TRAY_AGENT_NAME = "wayport-tray-agent"
+GUEST_CONTROL_DAEMON_NAME = "wayport-daemon"
+GUEST_SYSTEMD_UNIT_NAME = "wayport-guest.service"
+
+
+class TransportError(RuntimeError):
+    """Raised when a host-to-guest transport operation fails."""
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    """Resolved runtime configuration after merging defaults, env vars, and CLI flags."""
+
+    mode: str
+    vm_target: str
+    vsock_cid: int | None
+    vm_label: str
+    vm_slug: str
+    compression: str
+    no_gpu: bool
+    mask_idle_inhibit: bool
+    vsock_control_port: int
+    vsock_tray_port: int
+    compression_explicit: bool = False
+    no_gpu_explicit: bool = False
+
+    @property
+    def systemd_service_name(self) -> str:
+        return f"wayport-tray-{self.vm_slug}.service"
+
+    @property
+    def effective_mask_idle_inhibit(self) -> bool:
+        return self.mask_idle_inhibit and self.compression == "none"
+
+    def cli_target_args(self) -> list[str]:
+        """Builds canonical CLI flags to reproduce this config from .desktop or systemd."""
+        args: list[str] = ["--mode", self.mode]
+        if self.mode == "vsock":
+            if self.vsock_cid is not None:
+                args.extend(["--cid", str(self.vsock_cid)])
+            if self.vm_label and self.vm_label != f"cid-{self.vsock_cid}":
+                args.extend(["--target", self.vm_label])
+        else:
+            args.extend(["--target", self.vm_target])
+
+        if self.compression_explicit:
+            args.extend(["--compression", self.compression])
+        if self.no_gpu_explicit:
+            args.append("--no-gpu" if self.no_gpu else "--gpu")
+        if self.vsock_control_port != VSOCK_CONTROL_PORT:
+            args.extend(["--control-port", str(self.vsock_control_port)])
+        if self.vsock_tray_port != VSOCK_TRAY_PORT:
+            args.extend(["--tray-port", str(self.vsock_tray_port)])
+        return args
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_int_env(name: str, default: int | None) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an integer, got {raw!r}") from exc
+
+
+def normalize_mode(raw_mode: str) -> str:
+    mode = raw_mode.strip().lower()
+    mode = MODE_ALIASES.get(mode, mode)
+    if mode not in VALID_MODES:
+        raise ValueError(
+            f"Unsupported transport mode {raw_mode!r}. Expected one of: hybrid, vsock (socket), ssh."
+        )
+    return mode
+
+
+def sanitize_vm_label(vm_target: str) -> str:
+    """Extracts a human-readable host label from an SSH target or VSOCK URI."""
+    cleaned = vm_target.strip()
+    if cleaned.startswith("vsock://"):
+        cleaned = f"cid-{cleaned[len('vsock://'):]}"
+    elif cleaned.startswith("cid:"):
+        cleaned = f"cid-{cleaned[len('cid:'):]}"
+    return cleaned.split("@", 1)[-1]
+
+
+def slugify_vm_label(label: str) -> str:
+    """Converts a VM label into a safe filename / systemd unit identifier."""
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", label.strip()).strip("-.")
+    return slug or "default"
+
+
+def build_runtime_config(
+    *,
+    mode: str | None = None,
+    vm_target: str | None = None,
+    vsock_cid: int | None = None,
+    compression: str | None = None,
+    no_gpu: bool | None = None,
+    tray_port: int | None = None,
+    control_port: int | None = None,
+    mask_idle_inhibit: bool | None = None,
+    require_target: bool = True,
+) -> RuntimeConfig:
+    """Merges CLI flags, WAYPORT_* environment variables, and top-of-file defaults."""
+    env_mode = os.environ.get("WAYPORT_MODE")
+    env_target = os.environ.get("WAYPORT_TARGET")
+    env_cid = _parse_int_env("WAYPORT_CID", DEFAULT_VSOCK_CID)
+    env_comp = os.environ.get("WAYPORT_COMPRESSION")
+
+    raw_vm = vm_target if vm_target is not None else (env_target if env_target is not None else DEFAULT_TARGET)
+    raw_vm = raw_vm.strip()
+    resolved_cid = vsock_cid if vsock_cid is not None else env_cid
+
+    inferred_vsock_from_uri = False
+    if raw_vm.startswith("vsock://") or raw_vm.startswith("cid:"):
+        cid_str = raw_vm.split("://", 1)[-1] if raw_vm.startswith("vsock://") else raw_vm.split(":", 1)[-1]
+        if cid_str.isdigit():
+            if resolved_cid is None:
+                resolved_cid = int(cid_str)
+            inferred_vsock_from_uri = True
+
+    if mode is not None:
+        resolved_mode = normalize_mode(mode)
+    elif env_mode:
+        resolved_mode = normalize_mode(env_mode)
+    elif inferred_vsock_from_uri or (resolved_cid is not None and not raw_vm):
+        resolved_mode = "vsock"
+    else:
+        resolved_mode = normalize_mode(DEFAULT_TRANSPORT_MODE)
+
+    if resolved_mode == "vsock" and resolved_cid is None and raw_vm.isdigit():
+        resolved_cid = int(raw_vm)
+
+    if require_target:
+        if resolved_mode == "vsock":
+            if resolved_cid is None:
+                raise ValueError(
+                    "VSOCK mode requires a guest CID. Pass --cid <N> (or --target vsock://<N>) "
+                    "or set DEFAULT_VSOCK_CID / WAYPORT_CID."
+                )
+            if resolved_cid < 3:
+                raise ValueError(
+                    f"Guest VSOCK CID must be >= 3 (0=hypervisor, 1=local, 2=host), got {resolved_cid}."
+                )
+        else:
+            if not raw_vm:
+                raise ValueError(
+                    f"Mode '{resolved_mode}' requires a target. Pass --target user@host "
+                    "or set DEFAULT_TARGET / WAYPORT_TARGET."
+                )
+
+    if resolved_mode == "vsock":
+        if raw_vm and not raw_vm.isdigit() and not raw_vm.startswith(("vsock://", "cid:")):
+            vm_label = sanitize_vm_label(raw_vm)
+        elif resolved_cid is not None:
+            vm_label = f"cid-{resolved_cid}"
+        else:
+            vm_label = "vsock"
+    else:
+        vm_label = sanitize_vm_label(raw_vm) if raw_vm else "vm"
+
+    comp_explicit = compression is not None
+    raw_comp = compression if compression is not None else (env_comp or "")
+    if raw_comp:
+        resolved_comp = raw_comp.strip().lower()
+        if resolved_comp not in VALID_COMPRESSIONS:
+            raise ValueError(f"Unsupported compression {raw_comp!r}. Choose from: none, lz4, zstd.")
+    else:
+        resolved_comp = WAYPIPE_COMPRESSION_SSH if resolved_mode == "ssh" else WAYPIPE_COMPRESSION_VSOCK
+
+    no_gpu_explicit = no_gpu is not None
+    if no_gpu is not None:
+        resolved_no_gpu = no_gpu
+    elif os.environ.get("WAYPORT_NO_GPU") is not None:
+        resolved_no_gpu = _parse_bool_env("WAYPORT_NO_GPU", True)
+    else:
+        resolved_no_gpu = WAYPIPE_NO_GPU_SSH if resolved_mode == "ssh" else WAYPIPE_NO_GPU_VSOCK
+
+    resolved_mask = (
+        mask_idle_inhibit
+        if mask_idle_inhibit is not None
+        else _parse_bool_env("WAYPORT_MASK_IDLE_INHIBIT", MASK_IDLE_INHIBIT)
+    )
+    resolved_ctrl_port = (
+        control_port
+        if control_port is not None
+        else (_parse_int_env("WAYPORT_CONTROL_PORT", VSOCK_CONTROL_PORT) or VSOCK_CONTROL_PORT)
+    )
+    resolved_tray_port = (
+        tray_port
+        if tray_port is not None
+        else (_parse_int_env("WAYPORT_TRAY_PORT", VSOCK_TRAY_PORT) or VSOCK_TRAY_PORT)
+    )
+
+    return RuntimeConfig(
+        mode=resolved_mode,
+        vm_target=raw_vm,
+        vsock_cid=resolved_cid,
+        vm_label=vm_label,
+        vm_slug=slugify_vm_label(vm_label),
+        compression=resolved_comp,
+        no_gpu=resolved_no_gpu,
+        mask_idle_inhibit=resolved_mask,
+        vsock_control_port=resolved_ctrl_port,
+        vsock_tray_port=resolved_tray_port,
+        compression_explicit=comp_explicit,
+        no_gpu_explicit=no_gpu_explicit,
+    )
+
+
+# ==============================================================================
+# 1. Embedded Guest Scripts (Rendered Dynamically from Configuration)
+# ==============================================================================
+
+GUEST_WRAPPER_TEMPLATE = r"""#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Automatically deployed by wayport.
+# Outer modes:
+#   wayport-wrapper --vsock-port <PORT> [--compression <C>] [--no-gpu|--gpu] [--] <cmd> [args...]
+#   wayport-wrapper --unix-sock <PATH>  [--compression <C>] [--no-gpu|--gpu] [--] <cmd> [args...]
+# Inner mode (invoked by `waypipe server`):
+#   wayport-wrapper --inner <cmd> [args...]
+
+set -uo pipefail
+
+ENABLE_PORTAL_ROUTING=__ENABLE_PORTAL_ROUTING__
+ENABLE_SINGLETON_TAKEOVER=__ENABLE_SINGLETON_TAKEOVER__
+VULKAN_USE_LVP=__VULKAN_USE_LVP__
+GUEST_LOCALE=__GUEST_LOCALE__
+FAST_FORK_THRESHOLD_SEC=__FAST_FORK_THRESHOLD_SEC__
+AUTO_DETECT_ELECTRON=__AUTO_DETECT_ELECTRON__
+ELECTRON_SHM_NUDGE_APPS=(__ELECTRON_SHM_NUDGE_APPS__)
+ELECTRON_SHM_NUDGE_DELAY_SEC=__ELECTRON_SHM_NUDGE_DELAY_SEC__
+
+UID_VAL="$(id -u)"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/${UID_VAL}}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+
+if [ "${1:-}" = "--vsock-port" ] || [ "${1:-}" = "--unix-sock" ]; then
+    TRANSPORT_KIND="$1"
+    TRANSPORT_TARGET="${2:-}"
+    shift 2
+
+    WP_COMP="none"
+    WP_NO_GPU="1"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --compression)
+                WP_COMP="${2:-none}"
+                shift 2
+                ;;
+            --no-gpu)
+                WP_NO_GPU="1"
+                shift
+                ;;
+            --gpu)
+                WP_NO_GPU="0"
+                shift
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [ "$#" -eq 0 ]; then
+        echo "[ERROR] No guest command provided to wayport-wrapper." >&2
+        exit 1
+    fi
+
+    WP_ARGS=(-c "$WP_COMP")
+    if [ "$WP_NO_GPU" = "1" ]; then
+        WP_ARGS+=(--no-gpu)
+    fi
+    export WAYPORT_NO_GPU="$WP_NO_GPU"
+
+    if [ "$TRANSPORT_KIND" = "--vsock-port" ]; then
+        if [ ! -e /dev/vsock ]; then
+            echo "[ERROR] /dev/vsock is missing inside the guest VM. Attach a Virtio VSOCK device." >&2
+            exit 1
+        fi
+        export WAYPORT_INSTANCE_ID="wayport_vsock_${TRANSPORT_TARGET}_$$_${RANDOM}"
+        exec waypipe "${WP_ARGS[@]}" --vsock -s "$TRANSPORT_TARGET" server -- "$0" --inner "$@"
+    else
+        export WAYPORT_UNIX_SOCK="$TRANSPORT_TARGET"
+        export WAYPORT_INSTANCE_ID="wayport_ssh_$$_${RANDOM}"
+        exec waypipe "${WP_ARGS[@]}" -s "$TRANSPORT_TARGET" server -- "$0" --inner "$@"
+    fi
+fi
+
+if [ "${1:-}" = "--inner" ]; then
+    shift
+fi
+
+if [ "$#" -eq 0 ]; then
+    echo "[ERROR] No guest command provided to wayport-wrapper --inner." >&2
+    exit 1
+fi
+
+export WAYPORT_INSTANCE_ID="${WAYPORT_INSTANCE_ID:-wayport_$$_${RANDOM}}"
+WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}"
+
+case "$WAYLAND_DISPLAY" in
+    /*) WP_SOCK="$WAYLAND_DISPLAY" ;;
+    *)  WP_SOCK="${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}" ;;
+esac
+
+# 1. Configure xdg-desktop-portal for KDE FileChooser/Settings while disabling
+#    Notification/Inhibit portals so apps use our fast D-Bus responders directly.
+if [ "$ENABLE_PORTAL_ROUTING" -eq 1 ]; then
+    mkdir -p "${HOME}/.config/xdg-desktop-portal"
+    cat > "${HOME}/.config/xdg-desktop-portal/portals.conf" << 'EOF'
+[preferred]
+default=kde
+org.freedesktop.impl.portal.FileChooser=kde
+org.freedesktop.impl.portal.Settings=kde
+org.freedesktop.impl.portal.Inhibit=none
+org.freedesktop.impl.portal.Notification=none
+org.freedesktop.impl.portal.Background=none
+org.freedesktop.impl.portal.GlobalShortcuts=none
+EOF
+fi
+
+# 2. Safe singleton takeover: match ONLY process comm/executable name (not arbitrary
+#    command-line substrings) and terminate only non-waypipe or stale-socket instances.
+APP_BIN="$(basename "$1")"
+APP_MATCH="$APP_BIN"
+case "$APP_BIN" in
+    google-chrome*|chromium*) APP_MATCH="chrome" ;;
+    claude*)                  APP_MATCH="claude" ;;
+    antigravity*)             APP_MATCH="antigravity" ;;
+    code|code-insiders)       APP_MATCH="code" ;;
+esac
+
+matches_app_proc() {
+    local pid="$1"
+    local comm exe_base
+    comm="$(tr -d '\n' < "/proc/${pid}/comm" 2>/dev/null || true)"
+    exe_base="$(basename "$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)" 2>/dev/null || true)"
+    case "$comm" in
+        "$APP_MATCH"|"$APP_MATCH"*|"$APP_BIN"|"$APP_BIN"*) return 0 ;;
+    esac
+    case "$exe_base" in
+        "$APP_MATCH"|"$APP_MATCH"*|"$APP_BIN"|"$APP_BIN"*) return 0 ;;
+    esac
+    return 1
+}
+
+SKIP_SINGLETON_TAKEOVER=0
+case "$APP_BIN" in
+    sh|bash|dash|zsh|fish|env|python|python3|python3.*|node|perl|ruby|java|flatpak|snap)
+        SKIP_SINGLETON_TAKEOVER=1
+        ;;
+esac
+
+if [ "$ENABLE_SINGLETON_TAKEOVER" -eq 1 ] && [ "$SKIP_SINGLETON_TAKEOVER" -eq 0 ]; then
+    ANCESTOR_PIDS=" $$ $PPID "
+    cur="$PPID"
+    while [ -n "$cur" ] && [ "$cur" -gt 1 ] 2>/dev/null; do
+        parent="$(sed -n 's/.*) [^ ]* \([0-9]*\).*/\1/p' "/proc/${cur}/stat" 2>/dev/null || true)"
+        [ -n "$parent" ] || break
+        [ "$parent" = "$cur" ] && break
+        ANCESTOR_PIDS="${ANCESTOR_PIDS}${parent} "
+        cur="$parent"
+    done
+
+    KILLED_PIDS=()
+    for pid_dir in /proc/[0-9]*; do
+        pid="${pid_dir#/proc/}"
+        case "$ANCESTOR_PIDS" in
+            *" ${pid} "*) continue ;;
+        esac
+        proc_uid="$(stat -c %u "$pid_dir" 2>/dev/null || true)"
+        [ "$proc_uid" = "$UID_VAL" ] || continue
+
+        matches_app_proc "$pid" || continue
+
+        [ -r "${pid_dir}/cmdline" ] || continue
+        cmdline="$({ tr '\0' ' ' < "${pid_dir}/cmdline"; } 2>/dev/null || true)"
+        [ -n "$cmdline" ] || continue
+        case "$cmdline" in
+            *waypipe*|*wayport-tray-agent*|*wayport-daemon*) continue ;;
+        esac
+
+        PROC_WD="$({ tr '\0' '\n' < "${pid_dir}/environ"; } 2>/dev/null | sed -n 's/^WAYLAND_DISPLAY=//p' | head -n 1 || true)"
+        case "$PROC_WD" in
+            /*) PROC_SOCK="$PROC_WD" ;;
+            *)  PROC_SOCK="${XDG_RUNTIME_DIR}/${PROC_WD}" ;;
+        esac
+
+        if ! grep -Fqz "WAYPORT_SESSION=1" "${pid_dir}/environ" 2>/dev/null || [ ! -S "$PROC_SOCK" ]; then
+            kill -TERM "$pid" 2>/dev/null || true
+            KILLED_PIDS+=("$pid")
+        fi
+    done
+
+    if [ "${#KILLED_PIDS[@]}" -gt 0 ]; then
+        for ((i = 0; i < 20; i++)); do
+            STILL_ALIVE=0
+            for kpid in "${KILLED_PIDS[@]}"; do
+                if kill -0 "$kpid" 2>/dev/null; then
+                    STILL_ALIVE=1
+                    break
+                fi
+            done
+            [ "$STILL_ALIVE" -eq 0 ] && break
+            sleep 0.1
+        done
+        for kpid in "${KILLED_PIDS[@]}"; do
+            kill -KILL "$kpid" 2>/dev/null || true
+        done
+    fi
+fi
+
+# 3. Wait briefly (up to 2s) for org.freedesktop.Notifications (wayport-tray-agent)
+if command -v dbus-send >/dev/null 2>&1; then
+    for ((i = 0; i < 20; i++)); do
+        if dbus-send --session --dest=org.freedesktop.DBus --type=method_call --print-reply \
+           /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner \
+           string:"org.freedesktop.Notifications" 2>/dev/null | grep -q "boolean true"; then
+            break
+        fi
+        sleep 0.1
+    done
+fi
+
+# 4. Route KDE FileChooser portal to active waypipe socket
+if [ "$ENABLE_PORTAL_ROUTING" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+    NEED_PORTAL_RESTART=0
+    CURRENT_HOST_SOCK="$(readlink "${XDG_RUNTIME_DIR}/wayland-host" 2>/dev/null || true)"
+    if [ -z "$CURRENT_HOST_SOCK" ] || [ ! -S "$CURRENT_HOST_SOCK" ]; then
+        ln -sf "$WP_SOCK" "${XDG_RUNTIME_DIR}/wayland-host"
+        NEED_PORTAL_RESTART=1
+    fi
+
+    if command -v dbus-send >/dev/null 2>&1; then
+        if ! dbus-send --session --print-reply --dest=org.freedesktop.portal.Desktop \
+             /org/freedesktop/portal/desktop org.freedesktop.DBus.Properties.Get \
+             string:"org.freedesktop.portal.FileChooser" string:"version" >/dev/null 2>&1; then
+            NEED_PORTAL_RESTART=1
+        fi
+    fi
+
+    if [ "$NEED_PORTAL_RESTART" -eq 1 ]; then
+        systemctl --user unmask xdg-desktop-portal.service plasma-xdg-desktop-portal-kde.service >/dev/null 2>&1 || true
+        systemctl --user set-environment \
+            WAYLAND_DISPLAY=wayland-host \
+            XDG_SESSION_TYPE=wayland \
+            QT_QPA_PLATFORM=wayland \
+            QT_QPA_PLATFORMTHEME=kde \
+            XDG_CURRENT_DESKTOP=KDE \
+            KDE_SESSION_VERSION=6 >/dev/null 2>&1 || true
+        if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+            dbus-update-activation-environment --systemd \
+                WAYLAND_DISPLAY=wayland-host \
+                XDG_SESSION_TYPE=wayland \
+                QT_QPA_PLATFORM=wayland \
+                QT_QPA_PLATFORMTHEME=kde \
+                XDG_CURRENT_DESKTOP=KDE \
+                KDE_SESSION_VERSION=6 >/dev/null 2>&1 || true
+        fi
+        systemctl --user restart --no-block plasma-xdg-desktop-portal-kde.service xdg-desktop-portal.service >/dev/null 2>&1 || true
+
+        if command -v dbus-send >/dev/null 2>&1; then
+            for ((i = 0; i < 10; i++)); do
+                if dbus-send --session --print-reply --dest=org.freedesktop.portal.Desktop \
+                   /org/freedesktop/portal/desktop org.freedesktop.DBus.Properties.Get \
+                   string:"org.freedesktop.portal.FileChooser" string:"version" >/dev/null 2>&1; then
+                    break
+                fi
+                sleep 0.1
+            done
+        fi
+    fi
+fi
+
+WP_SERVER_PID="$PPID"
+
+# shellcheck disable=SC2329  # Invoked indirectly via cleanup trap
+is_waypipe_sock_in_use() {
+    local sock_path="$1"
+    local sock_base
+    sock_base="$(basename "$sock_path")"
+    local pdir
+    for pdir in /proc/[0-9]*; do
+        [ -r "${pdir}/environ" ] || continue
+        if grep -Fqz "WAYLAND_DISPLAY=${sock_base}" "${pdir}/environ" 2>/dev/null || \
+           grep -Fqz "WAYLAND_DISPLAY=${sock_path}" "${pdir}/environ" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# shellcheck disable=SC2329  # Invoked via EXIT/INT/TERM trap
+cleanup() {
+    trap - EXIT INT TERM
+
+    # 1. Release or re-point wayland-host portal symlink
+    if [ "$ENABLE_PORTAL_ROUTING" -eq 1 ]; then
+        CURRENT_TARGET="$(readlink "${XDG_RUNTIME_DIR}/wayland-host" 2>/dev/null || true)"
+        if [ "$CURRENT_TARGET" = "$WP_SOCK" ]; then
+            OTHER_SOCK=""
+            for cand in "${XDG_RUNTIME_DIR}"/*waypipe*; do
+                [ -S "$cand" ] || continue
+                [ "$cand" = "$WP_SOCK" ] && continue
+                if is_waypipe_sock_in_use "$cand"; then
+                    OTHER_SOCK="$cand"
+                    break
+                fi
+            done
+            if [ -n "$OTHER_SOCK" ]; then
+                ln -sf "$OTHER_SOCK" "${XDG_RUNTIME_DIR}/wayland-host"
+                systemctl --user restart --no-block plasma-xdg-desktop-portal-kde.service >/dev/null 2>&1 || true
+            else
+                rm -f "${XDG_RUNTIME_DIR}/wayland-host"
+                systemctl --user set-environment WAYLAND_DISPLAY=wayland-0 >/dev/null 2>&1 || true
+                if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+                    dbus-update-activation-environment --systemd WAYLAND_DISPLAY=wayland-0 >/dev/null 2>&1 || true
+                fi
+                systemctl --user stop --no-block plasma-xdg-desktop-portal-kde.service >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+
+    # 2. Terminate all descendant/helper processes tagged with this session
+    TARGET_PIDS=()
+    for pid_dir in /proc/[0-9]*; do
+        pid="${pid_dir#/proc/}"
+        [ "$pid" = "$$" ] && continue
+        [ "$pid" = "$WP_SERVER_PID" ] && continue
+        if grep -Fqz "WAYPORT_INSTANCE_ID=${WAYPORT_INSTANCE_ID}" "${pid_dir}/environ" 2>/dev/null || \
+           { [ -n "$WAYLAND_DISPLAY" ] && grep -Fqz "WAYLAND_DISPLAY=${WAYLAND_DISPLAY}" "${pid_dir}/environ" 2>/dev/null; }; then
+            TARGET_PIDS+=("$pid")
+        fi
+    done
+
+    if [ "${#TARGET_PIDS[@]}" -gt 0 ]; then
+        for pid in "${TARGET_PIDS[@]}"; do
+            kill -TERM "$pid" 2>/dev/null || true
+        done
+        sleep 0.15
+        for pid in "${TARGET_PIDS[@]}"; do
+            kill -KILL "$pid" 2>/dev/null || true
+        done
+    fi
+
+    # 3. Terminate parent waypipe server and clean up sockets
+    rm -f "$WP_SOCK" 2>/dev/null || true
+    if [ -n "${WAYPORT_UNIX_SOCK:-}" ]; then
+        rm -f "$WAYPORT_UNIX_SOCK" 2>/dev/null || true
+    fi
+    if [ -n "$WP_SERVER_PID" ] && [ "$WP_SERVER_PID" -gt 1 ]; then
+        kill -TERM "$WP_SERVER_PID" 2>/dev/null || true
+        sleep 0.05
+        kill -KILL "$WP_SERVER_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# 5. Architecture-aware Vulkan Lavapipe ICD override
+if [ "$VULKAN_USE_LVP" -eq 1 ]; then
+    ARCH="$(uname -m)"
+    LVP_ICD="/usr/share/vulkan/icd.d/lvp_icd.${ARCH}.json"
+    if [ -f "$LVP_ICD" ]; then
+        export VK_DRIVER_FILES="$LVP_ICD"
+    fi
+fi
+
+# 6. Export Wayland, KDE 6, and KWallet 6 environment variables
+export WAYPORT_SESSION="1"
+export NO_AT_BRIDGE="1"
+export XDG_SESSION_TYPE="wayland"
+export XDG_CURRENT_DESKTOP="KDE"
+export KDE_SESSION_VERSION="6"
+export GTK_USE_PORTAL="1"
+export QT_QPA_PLATFORM="wayland"
+export QT_QPA_PLATFORMTHEME="kde"
+export GDK_BACKEND="wayland,x11"
+export ELECTRON_OZONE_PLATFORM_HINT="wayland"
+export MOZ_ENABLE_WAYLAND="1"
+export SDL_VIDEODRIVER="wayland"
+export LC_ALL="$GUEST_LOCALE"
+
+# 7. Auto-detect Electron/Chromium apps & prepare final command
+APP_CMD=("$@")
+if [ "$AUTO_DETECT_ELECTRON" -eq 1 ]; then
+    RESOLVED_BIN="$(command -v "$1" 2>/dev/null || printf '%s' "$1")"
+    REAL_BIN="$(readlink -f "$RESOLVED_BIN" 2>/dev/null || printf '%s' "$RESOLVED_BIN")"
+    BIN_DIR="$(dirname "$REAL_BIN")"
+    if [ -f "${BIN_DIR}/resources/app.asar" ] || [ -f "${BIN_DIR}/icudtl.dat" ] || [ -f "${BIN_DIR}/chrome_crashpad_handler" ]; then
+        HAS_OZONE=0
+        HAS_PWSTORE=0
+        for arg in "${APP_CMD[@]}"; do
+            case "$arg" in
+                --ozone-platform|--ozone-platform=*) HAS_OZONE=1 ;;
+                --password-store|--password-store=*) HAS_PWSTORE=1 ;;
+            esac
+        done
+        [ "$HAS_OZONE" -eq 0 ] && APP_CMD+=(--ozone-platform=wayland)
+        [ "$HAS_PWSTORE" -eq 0 ] && APP_CMD+=(--password-store=kwallet6)
+    fi
+fi
+
+should_shm_nudge() {
+    local bin_lc="${1,,}"
+    local pat
+    for pat in "${ELECTRON_SHM_NUDGE_APPS[@]}"; do
+        [ -n "$pat" ] || continue
+        case "$bin_lc" in
+            "$pat"|"$pat"*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# 8. Execute the application (with optional single-instance nudge for wl_shm ready-to-show deadlock)
+START_TS="$(date +%s)"
+NUDGE_PID=""
+"${APP_CMD[@]}" < /dev/null &
+APP_MAIN_PID=$!
+
+if [ "${WAYPORT_NO_GPU:-1}" = "1" ] && [ "${#ELECTRON_SHM_NUDGE_APPS[@]}" -gt 0 ] && should_shm_nudge "$APP_BIN"; then
+    (
+        sleep "$ELECTRON_SHM_NUDGE_DELAY_SEC"
+        if kill -0 "$APP_MAIN_PID" 2>/dev/null; then
+            "$1" --ozone-platform=wayland --password-store=kwallet6 >/dev/null 2>&1 || true
+        fi
+    ) &
+    NUDGE_PID=$!
+fi
+
+wait "$APP_MAIN_PID"
+APP_RC=$?
+if [ -n "$NUDGE_PID" ]; then
+    kill "$NUDGE_PID" 2>/dev/null || true
+    wait "$NUDGE_PID" 2>/dev/null || true
+fi
+END_TS="$(date +%s)"
+
+# 9. Keepalive loop for fast-forking CLI launchers (e.g. code, antigravity)
+if [ $((END_TS - START_TS)) -lt "$FAST_FORK_THRESHOLD_SEC" ]; then
+    MY_PID="$$"
+    sleep 0.5
+    while true; do
+        ALIVE=0
+        for pid_dir in /proc/[0-9]*; do
+            pid="${pid_dir#/proc/}"
+            [ "$pid" = "$MY_PID" ] && continue
+            [ "$pid" = "$WP_SERVER_PID" ] && continue
+            [ -r "${pid_dir}/cmdline" ] || continue
+            cmdline="$({ tr '\0' ' ' < "${pid_dir}/cmdline"; } 2>/dev/null || true)"
+            case "$cmdline" in
+                *crashpad*|*waypipe*|*wayport-tray-agent*|*wayport-daemon*) continue ;;
+            esac
+            if [ -r "${pid_dir}/environ" ] && grep -Fqz "WAYPORT_INSTANCE_ID=${WAYPORT_INSTANCE_ID}" "${pid_dir}/environ" 2>/dev/null; then
+                ALIVE=1
+                break
+            fi
+        done
+        [ "$ALIVE" -eq 1 ] || break
+        sleep 1
+    done
+fi
+
+exit "$APP_RC"
+"""
+
+
+GUEST_TRAY_AGENT_TEMPLATE = r'''#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""
+wayport-tray-agent: Guest-side StatusNotifierWatcher, StatusNotifierItem, DbusMenu,
+Desktop Notifications (org.freedesktop.Notifications), ScreenSaver Inhibit
+Responder, and Tray-Quit Watchdog over AF_VSOCK or SSH stdio.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import signal
+import socket
+import sys
+import threading
+import time
+from pathlib import Path
+
+UID = os.getuid()
+os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{UID}")
+os.environ.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{UID}/bus")
+
+import dbus
+import dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+try:
+    import gi
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
+    HAS_GDKPIXBUF = True
+except Exception:
+    HAS_GDKPIXBUF = False
+
+SNW_BUS_NAME = "org.kde.StatusNotifierWatcher"
+SNW_OBJ_PATH = "/StatusNotifierWatcher"
+SNW_IFACE = "org.kde.StatusNotifierWatcher"
+SNI_IFACE = "org.kde.StatusNotifierItem"
+DBUSMENU_IFACE = "com.canonical.dbusmenu"
+PROPS_IFACE = "org.freedesktop.DBus.Properties"
+
+SCREENSAVER_BUS_NAME = "org.freedesktop.ScreenSaver"
+SCREENSAVER_OBJ_PATH = "/org/freedesktop/ScreenSaver"
+SCREENSAVER_IFACE = "org.freedesktop.ScreenSaver"
+
+NOTIF_BUS_NAME = "org.freedesktop.Notifications"
+NOTIF_OBJ_PATH = "/org/freedesktop/Notifications"
+NOTIF_IFACE = "org.freedesktop.Notifications"
+
+# Injected configuration from wayport
+IGNORED_GUEST_PROCS = frozenset(__IGNORED_GUEST_PROCS__)
+IGNORED_TRAY_IDS = frozenset(__IGNORED_TRAY_IDS__)
+SCAN_INTERVAL_MS = __TRAY_SCAN_INTERVAL_MS__
+QUIT_WATCHDOG_DELAY_SEC = __TRAY_QUIT_WATCHDOG_DELAY_SEC__
+QUIT_WINDOW_SEC = __TRAY_QUIT_WINDOW_SEC__
+ICON_SIZE = __TRAY_ICON_SIZE__
+MAX_ICON_BYTES = __TRAY_MAX_ICON_BYTES__
+MAX_THEME_FILES = __TRAY_MAX_THEME_FILES__
+ICON_SEARCH_DIRS = __ICON_SEARCH_DIRS__
+
+SYSTEM_ICON_ROOTS = (
+    Path("/usr/share/icons"),
+    Path("/usr/local/share/icons"),
+    Path("/usr/share/pixmaps"),
+    Path.home() / ".local" / "share" / "icons",
+)
+
+
+def log_err(msg: str) -> None:
+    sys.stderr.write(f"[GUEST-TRAY-AGENT] {msg}\n")
+    sys.stderr.flush()
+
+
+def is_system_icon_dir(theme_dir: Path) -> bool:
+    try:
+        resolved = theme_dir.resolve()
+    except OSError:
+        return True
+    for root in SYSTEM_ICON_ROOTS:
+        try:
+            r_root = root.resolve()
+            if resolved == r_root or resolved.is_relative_to(r_root):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def inspect_guest_process(bus: dbus.Bus, bus_name: str, item_id: str) -> tuple[bool, str, int, str]:
+    if item_id.lower() in IGNORED_TRAY_IDS:
+        return False, f"ignored_id:{item_id}", 0, ""
+
+    try:
+        dbus_obj = bus.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus")
+        dbus_iface = dbus.Interface(dbus_obj, "org.freedesktop.DBus")
+        pid = int(dbus_iface.GetConnectionUnixProcessID(bus_name))
+        comm = Path(f"/proc/{pid}/comm").read_text(errors="ignore").strip().lower()
+        cmdline = Path(f"/proc/{pid}/cmdline").read_text(errors="ignore").replace("\x00", " ").strip()
+        exe_name = Path(cmdline.split()[0]).name.lower() if cmdline else comm
+
+        instance_id = ""
+        try:
+            env_entries = Path(f"/proc/{pid}/environ").read_bytes().split(b"\x00")
+            for entry in env_entries:
+                if entry.startswith(b"WAYPORT_INSTANCE_ID="):
+                    instance_id = entry.split(b"=", 1)[1].decode("utf-8", errors="ignore")
+                    break
+        except OSError:
+            pass
+
+        if comm in IGNORED_GUEST_PROCS or exe_name in IGNORED_GUEST_PROCS:
+            return False, f"system_proc:{exe_name}({pid})", pid, instance_id
+        return True, f"{exe_name}({pid})", pid, instance_id
+    except Exception as exc:
+        return True, f"unknown_proc({exc})", 0, ""
+
+
+def terminate_lingering_instance(pid: int, instance_id: str) -> None:
+    time.sleep(QUIT_WATCHDOG_DELAY_SEC)
+    target_pids: set[int] = set()
+
+    if instance_id:
+        needle = f"WAYPORT_INSTANCE_ID={instance_id}".encode("utf-8")
+        for proc_dir in Path("/proc").glob("[0-9]*"):
+            try:
+                p = int(proc_dir.name)
+                cmdline = (proc_dir / "cmdline").read_bytes().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+                if any(tok in cmdline for tok in ("wayport-wrapper", "waypipe", "wayport-tray-agent", "wayport-daemon")):
+                    continue
+                env_items = (proc_dir / "environ").read_bytes().split(b"\x00")
+                if needle in env_items:
+                    target_pids.add(p)
+            except OSError:
+                continue
+    elif pid > 1:
+        try:
+            os.kill(pid, 0)
+            target_pids.add(pid)
+        except OSError:
+            pass
+
+    if not target_pids:
+        return
+
+    log_err(f"Watchdog: cleaning up lingering process tree after tray quit: {sorted(target_pids)}")
+    for p in target_pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+
+    time.sleep(0.3)
+    for p in target_pids:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+def serialize_pixmaps(raw_pixmaps) -> list[dict]:
+    result = []
+    if not raw_pixmaps:
+        return result
+    for item in raw_pixmaps:
+        try:
+            w, h, data = int(item[0]), int(item[1]), bytes(item[2])
+            if w > 0 and h > 0 and data:
+                result.append({"w": w, "h": h, "b64": base64.b64encode(data).decode("ascii")})
+        except Exception:
+            continue
+    return result
+
+
+def rgba_to_argb32(
+    pixels: bytes,
+    w: int,
+    h: int,
+    rowstride: int,
+    n_channels: int,
+    has_alpha: bool,
+) -> bytes:
+    """Vectorized row-slice conversion from GdkPixbuf RGB/RGBA to SNI ARGB32."""
+    out = bytearray(w * h * 4)
+    row_bytes = w * n_channels
+    alpha_full = b"\xff" * w
+    for y in range(h):
+        src_start = y * rowstride
+        row = pixels[src_start : src_start + row_bytes]
+        dst_start = y * w * 4
+        dst_end = dst_start + w * 4
+        if has_alpha and n_channels >= 4:
+            out[dst_start:dst_end:4] = row[3::n_channels]
+            out[dst_start + 1 : dst_end : 4] = row[0::n_channels]
+            out[dst_start + 2 : dst_end : 4] = row[1::n_channels]
+            out[dst_start + 3 : dst_end : 4] = row[2::n_channels]
+        else:
+            out[dst_start:dst_end:4] = alpha_full
+            out[dst_start + 1 : dst_end : 4] = row[0::n_channels]
+            out[dst_start + 2 : dst_end : 4] = row[1::n_channels]
+            out[dst_start + 3 : dst_end : 4] = row[2::n_channels]
+    return bytes(out)
+
+
+def file_to_argb32_pixmap(file_path: Path, size: int = ICON_SIZE) -> dict | None:
+    if not HAS_GDKPIXBUF or not file_path.is_file():
+        return None
+    try:
+        pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(file_path), size, size, True)
+        if not pixbuf:
+            return None
+        w = pixbuf.get_width()
+        h = pixbuf.get_height()
+        argb = rgba_to_argb32(
+            pixbuf.get_pixels(),
+            w,
+            h,
+            pixbuf.get_rowstride(),
+            pixbuf.get_n_channels(),
+            pixbuf.get_has_alpha(),
+        )
+        return {"w": w, "h": h, "b64": base64.b64encode(argb).decode("ascii")}
+    except Exception:
+        return None
+
+
+def locate_and_collect_icons(icon_theme_path: str, icon_name: str) -> tuple[dict[str, str], list[dict]]:
+    files: dict[str, str] = {}
+    fallback_pixmaps: list[dict] = []
+    candidate_files: list[Path] = []
+
+    if icon_theme_path:
+        theme_dir = Path(icon_theme_path)
+        if theme_dir.is_dir() and not is_system_icon_dir(theme_dir):
+            count = 0
+            for path in sorted(theme_dir.rglob("*")):
+                if count >= MAX_THEME_FILES:
+                    break
+                if path.is_file() and path.suffix.lower() in (".png", ".svg", ".xpm"):
+                    try:
+                        if path.stat().st_size <= MAX_ICON_BYTES:
+                            rel = str(path.relative_to(theme_dir))
+                            files[rel] = base64.b64encode(path.read_bytes()).decode("ascii")
+                            candidate_files.append(path)
+                            count += 1
+                    except OSError:
+                        pass
+
+    if icon_name:
+        if os.path.isabs(icon_name):
+            p = Path(icon_name)
+            if p.is_file():
+                candidate_files.insert(0, p)
+                try:
+                    if p.stat().st_size <= MAX_ICON_BYTES:
+                        files[p.name] = base64.b64encode(p.read_bytes()).decode("ascii")
+                except OSError:
+                    pass
+        elif not candidate_files:
+            for d in ICON_SEARCH_DIRS:
+                expanded = Path(os.path.expanduser(d))
+                for ext in (".png", ".svg", ".xpm"):
+                    cand = expanded / f"{icon_name}{ext}"
+                    if cand.is_file():
+                        candidate_files.append(cand)
+                        try:
+                            if cand.stat().st_size <= MAX_ICON_BYTES:
+                                files[cand.name] = base64.b64encode(cand.read_bytes()).decode("ascii")
+                        except OSError:
+                            pass
+                        break
+                if candidate_files:
+                    break
+
+    if candidate_files:
+        best_file = candidate_files[0]
+        if icon_name:
+            stem = Path(icon_name).stem
+            for c in candidate_files:
+                if c.stem == stem or c.name == icon_name:
+                    best_file = c
+                    break
+        px = file_to_argb32_pixmap(best_file, size=ICON_SIZE)
+        if px:
+            fallback_pixmaps.append(px)
+
+    return files, fallback_pixmaps
+
+
+def serialize_dbus_variant(val) -> dict:
+    if isinstance(val, dbus.Boolean):
+        return {"t": "b", "v": bool(val)}
+    if isinstance(val, (dbus.Int16, dbus.Int32, dbus.Int64, dbus.UInt16, dbus.UInt32, dbus.UInt64)):
+        return {"t": "i", "v": int(val)}
+    if isinstance(val, (dbus.ByteArray, bytes, bytearray)):
+        return {"t": "ay", "v": base64.b64encode(bytes(val)).decode("ascii")}
+    if isinstance(val, dbus.Array):
+        if getattr(val, "signature", "") == "y" or (len(val) > 0 and isinstance(val[0], dbus.Byte)):
+            return {"t": "ay", "v": base64.b64encode(bytes(val)).decode("ascii")}
+        rows = []
+        for row in val:
+            if isinstance(row, (list, tuple, dbus.Array)):
+                rows.append([str(x) for x in row])
+        return {"t": "aas", "v": rows}
+    return {"t": "s", "v": str(val)}
+
+
+def serialize_menu_node(node) -> dict:
+    item_id = int(node[0])
+    raw_props = node[1]
+    raw_children = node[2]
+
+    props = {str(k): serialize_dbus_variant(v) for k, v in raw_props.items()}
+    children = []
+    for child in raw_children:
+        try:
+            children.append(serialize_menu_node(child))
+        except Exception:
+            continue
+    return {"id": item_id, "props": props, "children": children}
+
+
+class FastScreenSaverResponder(dbus.service.Object):
+    _cookie = 1000
+
+    @dbus.service.method(SCREENSAVER_IFACE, in_signature="ss", out_signature="u")
+    def Inhibit(self, application_name: str, reason: str) -> dbus.UInt32:
+        FastScreenSaverResponder._cookie += 1
+        return dbus.UInt32(FastScreenSaverResponder._cookie)
+
+    @dbus.service.method(SCREENSAVER_IFACE, in_signature="u", out_signature="")
+    def UnInhibit(self, cookie: int) -> None:
+        pass
+
+    @dbus.service.method(SCREENSAVER_IFACE, in_signature="", out_signature="b")
+    def GetActive(self) -> dbus.Boolean:
+        return dbus.Boolean(False)
+
+
+class EmbeddedNotificationsBridge(dbus.service.Object):
+    _notif_id = 100
+
+    def __init__(self, bus: dbus.Bus, send_fn) -> None:
+        super().__init__(bus, NOTIF_OBJ_PATH)
+        self.send_fn = send_fn
+
+    @dbus.service.method(NOTIF_IFACE, in_signature="", out_signature="as")
+    def GetCapabilities(self) -> dbus.Array:
+        return dbus.Array(["body", "body-markup", "icon-static"], signature="s")
+
+    @dbus.service.method(NOTIF_IFACE, in_signature="", out_signature="ssss")
+    def GetServerInformation(self):
+        return (
+            dbus.String("wayport Host Notification Bridge"),
+            dbus.String("KDE"),
+            dbus.String("6.0"),
+            dbus.String("1.2"),
+        )
+
+    @dbus.service.method(NOTIF_IFACE, in_signature="susssasa{sv}i", out_signature="u")
+    def Notify(
+        self,
+        app_name: str,
+        replaces_id: int,
+        app_icon: str,
+        summary: str,
+        body: str,
+        actions: list,
+        hints: dict,
+        expire_timeout: int,
+    ) -> dbus.UInt32:
+        if replaces_id and int(replaces_id) > 0:
+            nid = int(replaces_id)
+        else:
+            EmbeddedNotificationsBridge._notif_id += 1
+            nid = EmbeddedNotificationsBridge._notif_id
+
+        self.send_fn({
+            "event": "notify",
+            "id": nid,
+            "app_name": str(app_name or "VM App"),
+            "app_icon": str(app_icon or ""),
+            "summary": str(summary or ""),
+            "body": str(body or ""),
+            "timeout": int(expire_timeout),
+        })
+        return dbus.UInt32(nid)
+
+    @dbus.service.method(NOTIF_IFACE, in_signature="u", out_signature="")
+    def CloseNotification(self, nid: int) -> None:
+        self.NotificationClosed(dbus.UInt32(nid), dbus.UInt32(3))
+
+    @dbus.service.signal(NOTIF_IFACE, signature="uu")
+    def NotificationClosed(self, nid: int, reason: int) -> None:
+        pass
+
+    @dbus.service.signal(NOTIF_IFACE, signature="us")
+    def ActionInvoked(self, nid: int, action_key: str) -> None:
+        pass
+
+
+class EmbeddedStatusNotifierWatcher(dbus.service.Object):
+    def __init__(self, bus: dbus.Bus, agent) -> None:
+        super().__init__(bus, SNW_OBJ_PATH)
+        self.bus = bus
+        self.agent = agent
+        self.registered_items: dict[str, str] = {}
+
+    @dbus.service.method(SNW_IFACE, in_signature="s", out_signature="", sender_keyword="sender")
+    def RegisterStatusNotifierItem(self, service: str, sender: str = "") -> None:
+        service = str(service)
+        if service.startswith("/"):
+            bus_name = str(sender)
+            obj_path = service
+        elif "/" in service:
+            bus_name, rest = service.split("/", 1)
+            obj_path = "/" + rest
+        else:
+            bus_name = service
+            obj_path = "/StatusNotifierItem"
+
+        owner = self.agent.resolve_unique_owner(bus_name)
+        item_str = f"{owner}{obj_path}"
+        self.registered_items[item_str] = owner
+        self.StatusNotifierItemRegistered(item_str)
+        self.agent.on_item_registered(item_str)
+
+    @dbus.service.method(SNW_IFACE, in_signature="s", out_signature="")
+    def RegisterStatusNotifierHost(self, service: str) -> None:
+        self.StatusNotifierHostRegistered()
+
+    @dbus.service.method(PROPS_IFACE, in_signature="ss", out_signature="v")
+    def Get(self, interface_name: str, property_name: str):
+        return self.GetAll(interface_name).get(property_name, dbus.String("", variant_level=1))
+
+    @dbus.service.method(PROPS_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface_name: str) -> dbus.Dictionary:
+        if interface_name == SNW_IFACE:
+            return dbus.Dictionary(
+                {
+                    "RegisteredStatusNotifierItems": dbus.Array(
+                        [dbus.String(k) for k in self.registered_items.keys()],
+                        signature="s",
+                        variant_level=1,
+                    ),
+                    "IsStatusNotifierHostRegistered": dbus.Boolean(True, variant_level=1),
+                    "ProtocolVersion": dbus.Int32(0, variant_level=1),
+                },
+                signature="sv",
+            )
+        return dbus.Dictionary({}, signature="sv")
+
+    @dbus.service.signal(SNW_IFACE, signature="s")
+    def StatusNotifierItemRegistered(self, service: str) -> None:
+        pass
+
+    @dbus.service.signal(SNW_IFACE, signature="s")
+    def StatusNotifierItemUnregistered(self, service: str) -> None:
+        pass
+
+    @dbus.service.signal(SNW_IFACE, signature="")
+    def StatusNotifierHostRegistered(self) -> None:
+        pass
+
+    @dbus.service.signal(SNW_IFACE, signature="")
+    def StatusNotifierHostUnregistered(self) -> None:
+        pass
+
+    def remove_by_owner(self, lost_owner: str) -> None:
+        for item_str, owner in list(self.registered_items.items()):
+            if owner == lost_owner:
+                del self.registered_items[item_str]
+                self.StatusNotifierItemUnregistered(item_str)
+
+
+class GuestTrayAgent:
+    def __init__(self, send_fn) -> None:
+        self.send_fn = send_fn
+        self.bus = dbus.SessionBus()
+        self.items: dict[str, dict] = {}
+        self.signal_matches: dict[str, list] = {}
+        self.icon_cache: dict[str, tuple[tuple[str, str, float], str, list[dict]]] = {}
+        self.last_menu_event_ts: dict[str, float] = {}
+
+        self.embedded_watcher: EmbeddedStatusNotifierWatcher | None = None
+        self.watcher_bus_name: dbus.service.BusName | None = None
+        self.screensaver_obj: FastScreenSaverResponder | None = None
+        self.screensaver_bus_name: dbus.service.BusName | None = None
+        self.notif_obj: EmbeddedNotificationsBridge | None = None
+        self.notif_bus_name: dbus.service.BusName | None = None
+
+        self.host_bus_name_str = f"org.kde.StatusNotifierHost-{os.getpid()}"
+        self.host_bus_name = dbus.service.BusName(self.host_bus_name_str, bus=self.bus)
+
+        log_err(f"Connected to guest session D-Bus ({os.environ.get('DBUS_SESSION_BUS_ADDRESS')})")
+
+        self.bus.add_signal_receiver(
+            self.on_item_registered,
+            signal_name="StatusNotifierItemRegistered",
+            dbus_interface=SNW_IFACE,
+        )
+        self.bus.add_signal_receiver(
+            self.on_item_unregistered,
+            signal_name="StatusNotifierItemUnregistered",
+            dbus_interface=SNW_IFACE,
+        )
+        self.bus.add_signal_receiver(
+            self.on_name_owner_changed,
+            signal_name="NameOwnerChanged",
+            dbus_interface="org.freedesktop.DBus",
+        )
+
+        self.ensure_services_ready()
+        self.scan_watcher_items()
+        GLib.timeout_add(SCAN_INTERVAL_MS, self.scan_watcher_items)
+
+    def ensure_services_ready(self) -> None:
+        if self.notif_bus_name is None and not self.bus.name_has_owner(NOTIF_BUS_NAME):
+            try:
+                self.notif_bus_name = dbus.service.BusName(
+                    NOTIF_BUS_NAME,
+                    bus=self.bus,
+                    allow_replacement=True,
+                    replace_existing=True,
+                )
+                if self.notif_obj is None:
+                    self.notif_obj = EmbeddedNotificationsBridge(self.bus, self.send_fn)
+                log_err("Activated built-in org.freedesktop.Notifications bridge to host")
+            except Exception as exc:
+                log_err(f"Could not claim org.freedesktop.Notifications: {exc}")
+
+        if self.screensaver_bus_name is None and not self.bus.name_has_owner(SCREENSAVER_BUS_NAME):
+            try:
+                self.screensaver_bus_name = dbus.service.BusName(
+                    SCREENSAVER_BUS_NAME,
+                    bus=self.bus,
+                    allow_replacement=True,
+                    replace_existing=False,
+                )
+                if self.screensaver_obj is None:
+                    self.screensaver_obj = FastScreenSaverResponder(self.bus, SCREENSAVER_OBJ_PATH)
+            except Exception:
+                pass
+
+        if self.watcher_bus_name is not None:
+            return
+
+        if not self.bus.name_has_owner(SNW_BUS_NAME):
+            try:
+                self.watcher_bus_name = dbus.service.BusName(
+                    SNW_BUS_NAME,
+                    bus=self.bus,
+                    allow_replacement=True,
+                    replace_existing=False,
+                )
+                if self.embedded_watcher is None:
+                    self.embedded_watcher = EmbeddedStatusNotifierWatcher(self.bus, self)
+                self.embedded_watcher.StatusNotifierHostRegistered()
+                log_err("Headless VM mode: activated built-in org.kde.StatusNotifierWatcher")
+                return
+            except Exception as exc:
+                log_err(f"Could not claim StatusNotifierWatcher: {exc}")
+
+        try:
+            snw_obj = self.bus.get_object(SNW_BUS_NAME, SNW_OBJ_PATH)
+            dbus.Interface(snw_obj, SNW_IFACE).RegisterStatusNotifierHost(self.host_bus_name_str)
+        except Exception:
+            pass
+
+    def split_item_service_and_path(self, item_str: str) -> tuple[str, str]:
+        if "/" in item_str:
+            bus_name, rest = item_str.split("/", 1)
+            return bus_name, "/" + rest
+        return item_str, "/StatusNotifierItem"
+
+    def resolve_unique_owner(self, bus_name: str) -> str:
+        if bus_name.startswith(":"):
+            return bus_name
+        try:
+            dbus_obj = self.bus.get_object("org.freedesktop.DBus", "/org/freedesktop/DBus")
+            return str(dbus.Interface(dbus_obj, "org.freedesktop.DBus").GetNameOwner(bus_name))
+        except Exception:
+            return bus_name
+
+    def scan_watcher_items(self) -> bool:
+        self.ensure_services_ready()
+
+        if self.watcher_bus_name is not None and self.embedded_watcher is not None:
+            registered = list(self.embedded_watcher.registered_items.keys())
+        else:
+            try:
+                snw_obj = self.bus.get_object(SNW_BUS_NAME, SNW_OBJ_PATH)
+                registered = dbus.Interface(snw_obj, PROPS_IFACE).Get(SNW_IFACE, "RegisteredStatusNotifierItems")
+            except Exception:
+                return True
+
+        current_keys = set()
+        for item_str in registered:
+            bus_name, obj_path = self.split_item_service_and_path(str(item_str))
+            owner = self.resolve_unique_owner(bus_name)
+            key = f"{owner}{obj_path}"
+            current_keys.add(key)
+            if key not in self.items:
+                self.try_register_item(key, bus_name, owner, obj_path)
+
+        for old_key in list(self.items.keys()):
+            if old_key not in current_keys:
+                self.unregister_item(old_key)
+
+        return True
+
+    def on_item_registered(self, item_str: str) -> None:
+        bus_name, obj_path = self.split_item_service_and_path(str(item_str))
+        owner = self.resolve_unique_owner(bus_name)
+        key = f"{owner}{obj_path}"
+        if key not in self.items:
+            self.try_register_item(key, bus_name, owner, obj_path)
+
+    def on_item_unregistered(self, item_str: str) -> None:
+        bus_name, obj_path = self.split_item_service_and_path(str(item_str))
+        owner = self.resolve_unique_owner(bus_name)
+        key = f"{owner}{obj_path}"
+        self.unregister_item(key)
+
+    def on_name_owner_changed(self, name: str, old_owner: str, new_owner: str) -> None:
+        name_s = str(name)
+        if name_s == SNW_BUS_NAME and not new_owner:
+            self.watcher_bus_name = None
+            self.ensure_services_ready()
+            return
+        if name_s == NOTIF_BUS_NAME and not new_owner:
+            self.notif_bus_name = None
+            self.ensure_services_ready()
+            return
+        if name_s == SCREENSAVER_BUS_NAME and not new_owner:
+            self.screensaver_bus_name = None
+            self.ensure_services_ready()
+            return
+
+        if old_owner and not new_owner:
+            if self.embedded_watcher is not None:
+                self.embedded_watcher.remove_by_owner(str(old_owner))
+            for key, meta in list(self.items.items()):
+                if meta["owner"] == old_owner or meta["bus_name"] == name_s:
+                    self.unregister_item(key)
+
+    def try_register_item(self, key: str, bus_name: str, owner: str, obj_path: str) -> None:
+        state = self.fetch_sni_state(key, owner, obj_path, force_icons=True)
+        if not state:
+            return
+
+        allowed, proc_info, pid, instance_id = inspect_guest_process(self.bus, owner, state.get("Id", ""))
+        if not allowed:
+            return
+
+        log_err(f"Bridging guest tray item '{state.get('Title') or state.get('Id')}' from {proc_info} [{key}]")
+
+        menu_path = state.get("MenuPath", "")
+        menu_layout = self.fetch_menu_layout(owner, menu_path) if menu_path else None
+
+        self.items[key] = {
+            "bus_name": bus_name,
+            "owner": owner,
+            "obj_path": obj_path,
+            "menu_path": menu_path,
+            "pid": pid,
+            "instance_id": instance_id,
+        }
+
+        matches = []
+        icon_signals = {"NewIcon", "NewAttentionIcon", "NewOverlayIcon"}
+        for sig_name in ("NewTitle", "NewIcon", "NewAttentionIcon", "NewOverlayIcon", "NewToolTip", "NewStatus"):
+            is_icon = sig_name in icon_signals
+            m = self.bus.add_signal_receiver(
+                lambda *args, k=key, ic=is_icon: self.push_sni_update(k, refresh_icons=ic),
+                signal_name=sig_name,
+                dbus_interface=SNI_IFACE,
+                bus_name=owner,
+                path=obj_path,
+            )
+            matches.append(m)
+
+        if menu_path:
+            for menu_sig in ("LayoutUpdated", "ItemsPropertiesUpdated"):
+                m = self.bus.add_signal_receiver(
+                    lambda *args, k=key: self.push_menu_update(k),
+                    signal_name=menu_sig,
+                    dbus_interface=DBUSMENU_IFACE,
+                    bus_name=owner,
+                    path=menu_path,
+                )
+                matches.append(m)
+
+        self.signal_matches[key] = matches
+        self.send_fn({
+            "event": "item_added",
+            "key": key,
+            "state": state,
+            "menu": menu_layout,
+        })
+
+    def unregister_item(self, key: str) -> None:
+        meta = self.items.pop(key, None)
+        if not meta:
+            return
+        self.icon_cache.pop(key, None)
+        last_click = self.last_menu_event_ts.pop(key, 0.0)
+        for match in self.signal_matches.pop(key, []):
+            try:
+                match.remove()
+            except Exception:
+                pass
+        self.send_fn({"event": "item_removed", "key": key})
+
+        # Only trigger lingering-process watchdog if a tray menu item was clicked recently
+        if last_click > 0 and (time.monotonic() - last_click) <= QUIT_WINDOW_SEC:
+            pid = meta.get("pid", 0)
+            instance_id = meta.get("instance_id", "")
+            if pid > 1 or instance_id:
+                threading.Thread(
+                    target=terminate_lingering_instance,
+                    args=(pid, instance_id),
+                    daemon=True,
+                ).start()
+
+    def _get_icons_cached(
+        self,
+        key: str,
+        icon_theme_path: str,
+        icon_name: str,
+        force_icons: bool,
+    ) -> tuple[dict[str, str] | None, list[dict]]:
+        mtime = 0.0
+        if icon_theme_path:
+            try:
+                mtime = Path(icon_theme_path).stat().st_mtime
+            except OSError:
+                mtime = 0.0
+        elif icon_name and os.path.isabs(icon_name):
+            try:
+                mtime = Path(icon_name).stat().st_mtime
+            except OSError:
+                mtime = 0.0
+
+        sig = (icon_theme_path, icon_name, mtime)
+        cached = self.icon_cache.get(key)
+        if cached is not None and cached[0] == sig and not force_icons:
+            # Theme files unchanged: omit ThemeFiles to avoid redundant host disk writes
+            return None, cached[2]
+
+        theme_files, fallback_pixmaps = locate_and_collect_icons(icon_theme_path, icon_name)
+        files_hash = hashlib.sha1(json.dumps(theme_files, sort_keys=True).encode("ascii")).hexdigest()
+        prev_hash = cached[1] if cached is not None else ""
+        self.icon_cache[key] = (sig, files_hash, fallback_pixmaps)
+
+        if not force_icons and files_hash == prev_hash:
+            return None, fallback_pixmaps
+        return theme_files, fallback_pixmaps
+
+    def fetch_sni_state(
+        self,
+        key: str,
+        owner: str,
+        obj_path: str,
+        *,
+        force_icons: bool = False,
+    ) -> dict | None:
+        try:
+            obj = self.bus.get_object(owner, obj_path)
+            raw = dbus.Interface(obj, PROPS_IFACE).GetAll(SNI_IFACE)
+        except Exception:
+            return None
+
+        icon_name = str(raw.get("IconName", ""))
+        icon_theme_path = str(raw.get("IconThemePath", ""))
+        theme_files, fallback_pixmaps = self._get_icons_cached(key, icon_theme_path, icon_name, force_icons)
+
+        if icon_name and os.path.isabs(icon_name):
+            icon_name = Path(icon_name).stem
+
+        icon_pixmaps = serialize_pixmaps(raw.get("IconPixmap"))
+        if not icon_pixmaps and fallback_pixmaps:
+            icon_pixmaps = fallback_pixmaps
+
+        raw_tt = raw.get("ToolTip")
+        if isinstance(raw_tt, (tuple, list, dbus.Struct)) and len(raw_tt) >= 4:
+            tooltip = {
+                "icon_name": str(raw_tt[0]),
+                "pixmaps": serialize_pixmaps(raw_tt[1]),
+                "title": str(raw_tt[2]),
+                "desc": str(raw_tt[3]),
+            }
+        else:
+            tooltip = {
+                "icon_name": "",
+                "pixmaps": [],
+                "title": str(raw.get("Title", "") or raw.get("Id", "")),
+                "desc": "",
+            }
+
+        menu_obj_path = str(raw.get("Menu", ""))
+        if menu_obj_path == "/NO_DBUSMENU":
+            menu_obj_path = ""
+
+        state: dict = {
+            "Category": str(raw.get("Category", "ApplicationStatus")),
+            "Id": str(raw.get("Id", "vm-app")),
+            "Title": str(raw.get("Title", "") or raw.get("Id", "VM App")),
+            "Status": str(raw.get("Status", "Active")),
+            "WindowId": int(raw.get("WindowId", 0)),
+            "IconName": icon_name,
+            "IconThemePath": icon_theme_path,
+            "IconPixmap": icon_pixmaps,
+            "OverlayIconName": str(raw.get("OverlayIconName", "")),
+            "OverlayIconPixmap": serialize_pixmaps(raw.get("OverlayIconPixmap")),
+            "AttentionIconName": str(raw.get("AttentionIconName", "")),
+            "AttentionIconPixmap": serialize_pixmaps(raw.get("AttentionIconPixmap")),
+            "AttentionMovieName": str(raw.get("AttentionMovieName", "")),
+            "ToolTip": tooltip,
+            "ItemIsMenu": bool(raw.get("ItemIsMenu", False)),
+            "MenuPath": menu_obj_path,
+        }
+        if theme_files is not None:
+            state["ThemeFiles"] = theme_files
+        return state
+
+    def fetch_menu_layout(self, owner: str, menu_path: str) -> dict | None:
+        if not menu_path:
+            return None
+        try:
+            obj = self.bus.get_object(owner, menu_path)
+            rev, root_node = dbus.Interface(obj, DBUSMENU_IFACE).GetLayout(
+                dbus.Int32(0),
+                dbus.Int32(-1),
+                dbus.Array([], signature="s"),
+            )
+            return {"revision": int(rev), "root": serialize_menu_node(root_node)}
+        except Exception:
+            return None
+
+    def push_sni_update(self, key: str, refresh_icons: bool = False) -> bool:
+        meta = self.items.get(key)
+        if not meta:
+            return False
+        state = self.fetch_sni_state(key, meta["owner"], meta["obj_path"], force_icons=refresh_icons)
+        if state:
+            self.send_fn({"event": "item_updated", "key": key, "state": state})
+        return False
+
+    def push_menu_update(self, key: str) -> bool:
+        meta = self.items.get(key)
+        if not meta or not meta.get("menu_path"):
+            return False
+        layout = self.fetch_menu_layout(meta["owner"], meta["menu_path"])
+        if layout:
+            self.send_fn({"event": "menu_updated", "key": key, "menu": layout})
+        return False
+
+    def handle_host_command(self, cmd_obj: dict) -> bool:
+        cmd = cmd_obj.get("cmd")
+        key = cmd_obj.get("key", "")
+        meta = self.items.get(key)
+        if not meta:
+            return False
+
+        owner = meta["owner"]
+        obj_path = meta["obj_path"]
+        menu_path = meta.get("menu_path", "")
+
+        try:
+            if cmd in ("Activate", "SecondaryActivate", "ContextMenu"):
+                obj = self.bus.get_object(owner, obj_path)
+                iface = dbus.Interface(obj, SNI_IFACE)
+                getattr(iface, cmd)(
+                    dbus.Int32(cmd_obj.get("x", 0)),
+                    dbus.Int32(cmd_obj.get("y", 0)),
+                    reply_handler=lambda *a: None,
+                    error_handler=lambda *a: None,
+                )
+            elif cmd == "Scroll":
+                obj = self.bus.get_object(owner, obj_path)
+                dbus.Interface(obj, SNI_IFACE).Scroll(
+                    dbus.Int32(cmd_obj.get("delta", 0)),
+                    dbus.String(cmd_obj.get("orientation", "vertical")),
+                    reply_handler=lambda *a: None,
+                    error_handler=lambda *a: None,
+                )
+            elif cmd == "ProvideXdgActivationToken":
+                obj = self.bus.get_object(owner, obj_path)
+                dbus.Interface(obj, SNI_IFACE).ProvideXdgActivationToken(
+                    dbus.String(cmd_obj.get("token", "")),
+                    reply_handler=lambda *a: None,
+                    error_handler=lambda *a: None,
+                )
+            elif cmd == "AboutToShow" and menu_path:
+                obj = self.bus.get_object(owner, menu_path)
+                dbus.Interface(obj, DBUSMENU_IFACE).AboutToShow(
+                    dbus.Int32(cmd_obj.get("menu_id", 0)),
+                    reply_handler=lambda *a: self.push_menu_update(key),
+                    error_handler=lambda *a: None,
+                )
+            elif cmd == "MenuEvent" and menu_path:
+                self.last_menu_event_ts[key] = time.monotonic()
+                obj = self.bus.get_object(owner, menu_path)
+                dbus.Interface(obj, DBUSMENU_IFACE).Event(
+                    dbus.Int32(cmd_obj.get("menu_id", 0)),
+                    dbus.String(cmd_obj.get("event_id", "clicked")),
+                    dbus.Int32(0, variant_level=1),
+                    dbus.UInt32(cmd_obj.get("timestamp", 0)),
+                    reply_handler=lambda *a: None,
+                    error_handler=lambda *a: None,
+                )
+        except Exception as exc:
+            log_err(f"Command '{cmd}' failed on {key}: {exc}")
+
+        return False
+
+
+def main() -> None:
+    DBusGMainLoop(set_as_default=True)
+    loop = GLib.MainLoop()
+
+    vsock_sock = None
+    vsock_file_w = None
+    vsock_file_r = None
+    send_lock = threading.Lock()
+
+    if len(sys.argv) >= 3 and sys.argv[1] == "--vsock":
+        vsock_port = int(sys.argv[2])
+        try:
+            vsock_sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            vsock_sock.connect((2, vsock_port))  # CID 2 = VMADDR_CID_HOST
+        except OSError as exc:
+            log_err(f"Failed to connect to host AF_VSOCK (CID 2, port {vsock_port}): {exc}")
+            sys.exit(1)
+
+        vsock_file_r = vsock_sock.makefile("r", encoding="utf-8", errors="replace")
+        vsock_file_w = vsock_sock.makefile("w", encoding="utf-8", buffering=1)
+        reader_iter = vsock_file_r
+        log_err(f"Connected to host tray daemon via native AF_VSOCK (CID 2, port {vsock_port})")
+
+        def send_fn(payload: dict) -> None:
+            with send_lock:
+                try:
+                    vsock_file_w.write("TRAY_JSON:" + json.dumps(payload, separators=(",", ":")) + "\n")
+                    vsock_file_w.flush()
+                except Exception:
+                    GLib.idle_add(loop.quit)
+    else:
+        reader_iter = sys.stdin
+        log_err("Running guest tray agent in stdio mode (SSH)")
+
+        def send_fn(payload: dict) -> None:
+            with send_lock:
+                try:
+                    sys.stdout.write("TRAY_JSON:" + json.dumps(payload, separators=(",", ":")) + "\n")
+                    sys.stdout.flush()
+                except Exception:
+                    GLib.idle_add(loop.quit)
+
+    agent = GuestTrayAgent(send_fn)
+
+    def reader_worker() -> None:
+        try:
+            for raw_line in reader_iter:
+                line = raw_line.strip()
+                if line:
+                    try:
+                        cmd_obj = json.loads(line)
+                        GLib.idle_add(agent.handle_host_command, cmd_obj)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        finally:
+            GLib.idle_add(loop.quit)
+
+    def handle_term(_signum, _frame) -> None:
+        GLib.idle_add(loop.quit)
+
+    signal.signal(signal.SIGTERM, handle_term)
+    signal.signal(signal.SIGINT, handle_term)
+
+    threading.Thread(target=reader_worker, daemon=True).start()
+    try:
+        loop.run()
+    finally:
+        for obj in (vsock_file_w, vsock_file_r, vsock_sock):
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+GUEST_CONTROL_DAEMON_TEMPLATE = r'''#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""
+wayport-daemon: Pure-VSOCK JSON-RPC control daemon for ssh-less KVM guests.
+
+Listens on AF_VSOCK (VMADDR_CID_ANY, control_port) and only accepts connections
+from the KVM host (VMADDR_CID_HOST = 2) or local loopback (CID = 1).
+Zero third-party dependencies (Python 3 standard library only).
+"""
+
+from __future__ import annotations
+
+import base64
+import glob
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+VERSION = __VERSION__
+CONTROL_PORT = __VSOCK_CONTROL_PORT__
+ALLOW_SCRIPT_SYNC = __ALLOW_VSOCK_SCRIPT_SYNC__
+DESKTOP_APP_SEARCH_DIRS = __DESKTOP_APP_SEARCH_DIRS__
+ICON_SEARCH_DIRS = __ICON_SEARCH_DIRS__
+GUEST_BIN_DIR = Path(os.path.expanduser(__GUEST_BIN_DIR__))
+ALLOWED_SYNC_FILES = frozenset({"wayport-wrapper", "wayport-tray-agent"})
+
+VMADDR_CID_ANY = getattr(socket, "VMADDR_CID_ANY", 0xFFFFFFFF)
+VMADDR_CID_LOCAL = getattr(socket, "VMADDR_CID_LOCAL", 1)
+VMADDR_CID_HOST = getattr(socket, "VMADDR_CID_HOST", 2)
+
+
+def log_msg(msg: str) -> None:
+    sys.stderr.write(f"[WAYPORT-DAEMON] {msg}\n")
+    sys.stderr.flush()
+
+
+def list_desktop_apps() -> list[dict[str, str]]:
+    seen: set[str] = set()
+    apps: list[dict[str, str]] = []
+    for raw_dir in DESKTOP_APP_SEARCH_DIRS:
+        expanded = os.path.expanduser(raw_dir)
+        if not os.path.isdir(expanded):
+            continue
+        for path in sorted(glob.glob(os.path.join(expanded, "*.desktop"))):
+            app_id = os.path.basename(path)[:-8]
+            if app_id in seen:
+                continue
+            try:
+                txt = Path(path).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if "NoDisplay=true" in txt or "Type=Application" not in txt:
+                continue
+            name = next((line.split("=", 1)[1].strip() for line in txt.splitlines() if line.startswith("Name=")), "Unknown")
+            seen.add(app_id)
+            apps.append({"id": app_id, "name": name})
+    apps.sort(key=lambda item: item["id"])
+    return apps
+
+
+def read_desktop_file(app_id: str) -> str | None:
+    if not app_id or "/" in app_id or ".." in app_id:
+        return None
+    clean_id = app_id[:-8] if app_id.endswith(".desktop") else app_id
+    for raw_dir in DESKTOP_APP_SEARCH_DIRS:
+        cand = Path(os.path.expanduser(raw_dir)) / f"{clean_id}.desktop"
+        if cand.is_file():
+            try:
+                return cand.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+    return None
+
+
+def find_icon_file(icon_name: str) -> tuple[str, bytes] | None:
+    if not icon_name:
+        return None
+    if os.path.isabs(icon_name):
+        p = Path(icon_name)
+        if p.is_file():
+            try:
+                return p.suffix, p.read_bytes()
+            except OSError:
+                return None
+        return None
+
+    for raw_dir in ICON_SEARCH_DIRS:
+        base = Path(os.path.expanduser(raw_dir))
+        for ext in (".svg", ".png", ".xpm"):
+            cand = base / f"{icon_name}{ext}"
+            if cand.is_file():
+                try:
+                    return ext, cand.read_bytes()
+                except OSError:
+                    continue
+    return None
+
+
+def _send_json(conn: socket.socket, lock: threading.Lock, obj: dict) -> bool:
+    data = (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
+    with lock:
+        try:
+            conn.sendall(data)
+            return True
+        except OSError:
+            return False
+
+
+def _terminate_proc(proc: subprocess.Popen) -> None:
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
+
+def _stream_pipe(pipe, stream_name: str, conn: socket.socket, lock: threading.Lock) -> None:
+    try:
+        for raw_line in pipe:
+            text = raw_line.decode("utf-8", errors="replace")
+            if not _send_json(conn, lock, {"event": stream_name, "data": text}):
+                break
+    except Exception:
+        pass
+
+
+def handle_client(conn: socket.socket, peer_cid: int | None = None) -> None:
+    send_lock = threading.Lock()
+    try:
+        if peer_cid is not None and peer_cid not in (VMADDR_CID_HOST, VMADDR_CID_LOCAL):
+            log_msg(f"Rejected unauthorized VSOCK connection from CID {peer_cid}")
+            _send_json(conn, send_lock, {"ok": False, "error": f"Unauthorized peer CID {peer_cid}"})
+            return
+
+        reader = conn.makefile("r", encoding="utf-8", errors="replace")
+        raw_req = reader.readline()
+        if not raw_req:
+            return
+        req = json.loads(raw_req)
+        op = req.get("op", "")
+
+        if op == "ping":
+            uid = os.getuid()
+            runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+            _send_json(
+                conn,
+                send_lock,
+                {
+                    "ok": True,
+                    "version": VERSION,
+                    "uid": uid,
+                    "runtime_dir": runtime_dir,
+                    "allow_script_sync": ALLOW_SCRIPT_SYNC,
+                },
+            )
+            return
+
+        if op == "list_apps":
+            _send_json(conn, send_lock, {"ok": True, "apps": list_desktop_apps()})
+            return
+
+        if op == "get_desktop":
+            content = read_desktop_file(str(req.get("app_id", "")))
+            if content is None:
+                _send_json(conn, send_lock, {"ok": False, "error": "Desktop file not found"})
+            else:
+                _send_json(conn, send_lock, {"ok": True, "content": content})
+            return
+
+        if op == "get_icon":
+            found = find_icon_file(str(req.get("icon_name", "")))
+            if found is None:
+                _send_json(conn, send_lock, {"ok": False, "error": "Icon not found"})
+            else:
+                ext, raw_bytes = found
+                _send_json(
+                    conn,
+                    send_lock,
+                    {"ok": True, "ext": ext, "b64": base64.b64encode(raw_bytes).decode("ascii")},
+                )
+            return
+
+        if op == "sync_scripts":
+            if not ALLOW_SCRIPT_SYNC:
+                _send_json(conn, send_lock, {"ok": False, "error": "Script sync disabled by guest config"})
+                return
+            scripts = req.get("scripts") or {}
+            GUEST_BIN_DIR.mkdir(parents=True, exist_ok=True)
+            updated = []
+            for name, content in scripts.items():
+                if name not in ALLOWED_SYNC_FILES:
+                    continue
+                target = GUEST_BIN_DIR / name
+                tmp = GUEST_BIN_DIR / f".{name}.tmp.{os.getpid()}"
+                tmp.write_text(str(content), encoding="utf-8")
+                tmp.chmod(0o755)
+                tmp.replace(target)
+                updated.append(name)
+            _send_json(conn, send_lock, {"ok": True, "updated": updated})
+            return
+
+        if op == "run":
+            vsock_port = int(req.get("vsock_port", 0))
+            cmd_tokens = [str(tok) for tok in (req.get("cmd") or [])]
+            compression = str(req.get("compression", "none"))
+            no_gpu = bool(req.get("no_gpu", True))
+            if vsock_port <= 0 or not cmd_tokens:
+                _send_json(conn, send_lock, {"ok": False, "error": "Invalid vsock_port or cmd"})
+                return
+
+            wrapper_path = GUEST_BIN_DIR / "wayport-wrapper"
+            full_cmd = [
+                str(wrapper_path),
+                "--vsock-port",
+                str(vsock_port),
+                "--compression",
+                compression,
+                "--no-gpu" if no_gpu else "--gpu",
+                "--",
+                *cmd_tokens,
+            ]
+            proc = subprocess.Popen(
+                full_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            _send_json(conn, send_lock, {"ok": True, "event": "started", "pid": proc.pid})
+
+            t_out = threading.Thread(target=_stream_pipe, args=(proc.stdout, "stdout", conn, send_lock), daemon=True)
+            t_err = threading.Thread(target=_stream_pipe, args=(proc.stderr, "stderr", conn, send_lock), daemon=True)
+            t_out.start()
+            t_err.start()
+
+            # Watch for host disconnect or explicit cancel message
+            def watch_host() -> None:
+                try:
+                    for line in reader:
+                        if not line:
+                            break
+                        try:
+                            msg = json.loads(line)
+                            if msg.get("op") == "terminate":
+                                _terminate_proc(proc)
+                                break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                finally:
+                    _terminate_proc(proc)
+
+            threading.Thread(target=watch_host, daemon=True).start()
+            rc = proc.wait()
+            t_out.join(timeout=1.0)
+            t_err.join(timeout=1.0)
+            _send_json(conn, send_lock, {"event": "exit", "code": rc})
+            return
+
+        if op == "start_tray":
+            tray_port = int(req.get("vsock_port", 5001))
+            agent_path = GUEST_BIN_DIR / "wayport-tray-agent"
+            proc = subprocess.Popen(
+                [str(agent_path), "--vsock", str(tray_port)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            _send_json(conn, send_lock, {"ok": True, "event": "started", "pid": proc.pid})
+            t_err = threading.Thread(target=_stream_pipe, args=(proc.stderr, "stderr", conn, send_lock), daemon=True)
+            t_err.start()
+
+            def watch_tray_host() -> None:
+                try:
+                    for line in reader:
+                        if not line:
+                            break
+                except Exception:
+                    pass
+                finally:
+                    _terminate_proc(proc)
+
+            threading.Thread(target=watch_tray_host, daemon=True).start()
+            rc = proc.wait()
+            t_err.join(timeout=1.0)
+            _send_json(conn, send_lock, {"event": "exit", "code": rc})
+            return
+
+        _send_json(conn, send_lock, {"ok": False, "error": f"Unknown op: {op}"})
+    except Exception as exc:
+        _send_json(conn, send_lock, {"ok": False, "error": str(exc)})
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def main() -> None:
+    port = CONTROL_PORT
+    if len(sys.argv) >= 3 and sys.argv[1] == "--port":
+        port = int(sys.argv[2])
+
+    server = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((VMADDR_CID_ANY, port))
+    server.listen(16)
+    log_msg(f"Listening on AF_VSOCK (CID ANY, port {port})...")
+
+    stop_event = threading.Event()
+
+    def handle_stop(_signum, _frame) -> None:
+        stop_event.set()
+        try:
+            server.close()
+        except OSError:
+            pass
+
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+
+    while not stop_event.is_set():
+        try:
+            conn, addr = server.accept()
+        except OSError:
+            break
+        peer_cid = addr[0] if isinstance(addr, tuple) and addr else None
+        threading.Thread(target=handle_client, args=(conn, peer_cid), daemon=True).start()
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def render_guest_wrapper() -> str:
+    """Renders wayport-wrapper using top-of-file configuration constants."""
+    nudge_items = " ".join(shlex.quote(app.lower()) for app in ELECTRON_SHM_NUDGE_APPS)
+    replacements = {
+        "__ENABLE_PORTAL_ROUTING__": "1" if ENABLE_PORTAL_ROUTING else "0",
+        "__ENABLE_SINGLETON_TAKEOVER__": "1" if ENABLE_SINGLETON_TAKEOVER else "0",
+        "__VULKAN_USE_LVP__": "1" if VULKAN_USE_LVP else "0",
+        "__GUEST_LOCALE__": shlex.quote(GUEST_LOCALE),
+        "__FAST_FORK_THRESHOLD_SEC__": str(int(FAST_FORK_THRESHOLD_SEC)),
+        "__AUTO_DETECT_ELECTRON__": "1" if AUTO_DETECT_ELECTRON else "0",
+        "__ELECTRON_SHM_NUDGE_APPS__": nudge_items,
+        "__ELECTRON_SHM_NUDGE_DELAY_SEC__": repr(float(ELECTRON_SHM_NUDGE_DELAY_SEC)),
+    }
+    rendered = GUEST_WRAPPER_TEMPLATE
+    for placeholder, value in replacements.items():
+        rendered = rendered.replace(placeholder, value)
+    return rendered
+
+
+def render_guest_tray_agent() -> str:
+    """Renders wayport-tray-agent using top-of-file configuration constants."""
+    replacements = {
+        "__IGNORED_GUEST_PROCS__": json.dumps(sorted(IGNORED_GUEST_PROCS)),
+        "__IGNORED_TRAY_IDS__": json.dumps(sorted(IGNORED_TRAY_IDS)),
+        "__TRAY_SCAN_INTERVAL_MS__": str(int(TRAY_SCAN_INTERVAL_MS)),
+        "__TRAY_QUIT_WATCHDOG_DELAY_SEC__": repr(float(TRAY_QUIT_WATCHDOG_DELAY_SEC)),
+        "__TRAY_QUIT_WINDOW_SEC__": repr(float(TRAY_QUIT_WINDOW_SEC)),
+        "__TRAY_ICON_SIZE__": str(int(TRAY_ICON_SIZE)),
+        "__TRAY_MAX_ICON_BYTES__": str(int(TRAY_MAX_ICON_BYTES)),
+        "__TRAY_MAX_THEME_FILES__": str(int(TRAY_MAX_THEME_FILES)),
+        "__ICON_SEARCH_DIRS__": json.dumps(list(ICON_SEARCH_DIRS)),
+    }
+    rendered = GUEST_TRAY_AGENT_TEMPLATE
+    for placeholder, value in replacements.items():
+        rendered = rendered.replace(placeholder, value)
+    return rendered
+
+
+def render_guest_control_daemon(control_port: int = VSOCK_CONTROL_PORT) -> str:
+    """Renders wayport-daemon using top-of-file configuration constants."""
+    replacements = {
+        "__VERSION__": json.dumps(__version__),
+        "__VSOCK_CONTROL_PORT__": str(int(control_port)),
+        "__ALLOW_VSOCK_SCRIPT_SYNC__": "True" if ALLOW_VSOCK_SCRIPT_SYNC else "False",
+        "__DESKTOP_APP_SEARCH_DIRS__": json.dumps(list(DESKTOP_APP_SEARCH_DIRS)),
+        "__ICON_SEARCH_DIRS__": json.dumps(list(ICON_SEARCH_DIRS)),
+        "__GUEST_BIN_DIR__": json.dumps(GUEST_BIN_DIR),
+    }
+    rendered = GUEST_CONTROL_DAEMON_TEMPLATE
+    for placeholder, value in replacements.items():
+        rendered = rendered.replace(placeholder, value)
+    return rendered
+
+
+def compute_guest_scripts_hash(control_port: int = VSOCK_CONTROL_PORT) -> str:
+    """Computes a stable content hash of all rendered guest scripts."""
+    digest = hashlib.sha256()
+    digest.update(render_guest_wrapper().encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(render_guest_tray_agent().encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update(render_guest_control_daemon(control_port).encode("utf-8"))
+    return digest.hexdigest()[:12]
+
+
+# ==============================================================================
+# 2. Boundary-Safe Socket Stream Bridge (AF_VSOCK <-> AF_UNIX & AF_UNIX <-> AF_UNIX)
+# ==============================================================================
+
+def longest_matching_prefix_len(data: bytes, needle: bytes) -> int:
+    """Returns the length of the longest suffix of `data` that is a proper prefix of `needle`."""
+    max_k = min(len(data), len(needle) - 1)
+    for k in range(max_k, 0, -1):
+        if data.endswith(needle[:k]):
+            return k
+    return 0
+
+
+def pump_socket_stream(
+    src: socket.socket,
+    dst: socket.socket,
+    *,
+    mask_idle_inhibit: bool = False,
+    chunk_size: int = STREAM_CHUNK_SIZE,
+) -> None:
+    """
+    Forwards bytes from `src` to `dst` until EOF.
+    When `mask_idle_inhibit=True`, replaces the 27-byte Wayland global name
+    `zwp_idle_inhibit_manager_v1` with `zwp_idle_inhibit_disabledv1`, even if
+    the string is split across arbitrary `recv()` chunk boundaries.
+    """
+    pending = b""
+    try:
+        while True:
+            chunk = src.recv(chunk_size)
+            if not chunk:
+                if pending:
+                    dst.sendall(pending)
+                    pending = b""
+                break
+
+            if mask_idle_inhibit:
+                buf = pending + chunk
+                if IDLE_INHIBIT_NEEDLE in buf:
+                    buf = buf.replace(IDLE_INHIBIT_NEEDLE, IDLE_INHIBIT_REPLACEMENT)
+                keep = longest_matching_prefix_len(buf, IDLE_INHIBIT_NEEDLE)
+                if keep:
+                    to_send, pending = buf[:-keep], buf[-keep:]
+                else:
+                    to_send, pending = buf, b""
+                if to_send:
+                    dst.sendall(to_send)
+            else:
+                dst.sendall(chunk)
+    except OSError:
+        pass
+    finally:
+        try:
+            dst.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+
+
+def bridge_socket_pair(
+    guest_conn: socket.socket,
+    host_conn: socket.socket,
+    *,
+    mask_idle_inhibit: bool = False,
+    chunk_size: int = STREAM_CHUNK_SIZE,
+) -> tuple[threading.Thread, threading.Thread]:
+    """
+    Starts bidirectional pumping between `guest_conn` and `host_conn` and closes
+    both file descriptors once both pump directions have completed.
+    """
+    state_lock = threading.Lock()
+    remaining = [2]
+
+    def run_direction(src: socket.socket, dst: socket.socket, mask: bool) -> None:
+        try:
+            pump_socket_stream(src, dst, mask_idle_inhibit=mask, chunk_size=chunk_size)
+        finally:
+            should_close = False
+            with state_lock:
+                remaining[0] -= 1
+                if remaining[0] == 0:
+                    should_close = True
+            if should_close:
+                for sock in (guest_conn, host_conn):
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+
+    t_g2h = threading.Thread(target=run_direction, args=(guest_conn, host_conn, False), daemon=True)
+    t_h2g = threading.Thread(target=run_direction, args=(host_conn, guest_conn, mask_idle_inhibit), daemon=True)
+    t_g2h.start()
+    t_h2g.start()
+    return t_g2h, t_h2g
+
+
+def accept_and_bridge_loop(
+    listener_sock: socket.socket,
+    target_unix_sock_path: str,
+    *,
+    mask_idle_inhibit: bool = False,
+    chunk_size: int = STREAM_CHUNK_SIZE,
+) -> None:
+    """
+    Accepts connections on `listener_sock` (AF_VSOCK or AF_UNIX) and bridges
+    each connection to the host `waypipe client` Unix socket.
+    """
+    while True:
+        try:
+            incoming_conn, _ = listener_sock.accept()
+        except OSError:
+            break
+
+        try:
+            unix_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            unix_conn.connect(target_unix_sock_path)
+        except OSError:
+            try:
+                incoming_conn.close()
+            except OSError:
+                pass
+            continue
+
+        bridge_socket_pair(
+            incoming_conn,
+            unix_conn,
+            mask_idle_inhibit=mask_idle_inhibit,
+            chunk_size=chunk_size,
+        )
+
+
+def create_vsock_listener(
+    port_min: int = VSOCK_APP_PORT_MIN,
+    port_max: int = VSOCK_APP_PORT_MAX,
+) -> tuple[socket.socket, int]:
+    """Binds a host AF_VSOCK listening socket on the first free port in [port_min, port_max)."""
+    last_err: OSError | None = None
+    for port in range(port_min, port_max):
+        s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((VMADDR_CID_ANY, port))
+            s.listen(32)
+            return s, port
+        except OSError as exc:
+            last_err = exc
+            s.close()
+            continue
+    raise TransportError(
+        f"Could not bind any host AF_VSOCK port in {port_min}..{port_max - 1} ({last_err}). "
+        "Ensure 'vhost_vsock' is loaded (`sudo modprobe vhost_vsock`) and a Virtio VSOCK device is attached."
+    )
+
+
+def create_unix_listener(sock_path: Path) -> socket.socket:
+    """Binds a host AF_UNIX listening socket with mode 0600."""
+    sock_path.unlink(missing_ok=True)
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.bind(str(sock_path))
+    os.chmod(sock_path, 0o600)
+    s.listen(32)
+    return s
+
+
+# ==============================================================================
+# 3. Control Transport Layer (SSHControlTransport & VsockControlTransport)
+# ==============================================================================
+
+def _build_ssh_base_cmd(
+    vm_target: str,
+    *,
+    disable_mux: bool = False,
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    cmd = [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+        "-o",
+        f"ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}",
+        "-o",
+        f"ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}",
+    ]
+    if disable_mux:
+        cmd.extend(["-o", "ControlMaster=no", "-o", "ControlPath=none"])
+    for opt in SSH_EXTRA_OPTIONS:
+        cmd.extend(["-o", opt])
+    if extra_args:
+        cmd.extend(extra_args)
+    cmd.append(vm_target)
+    return cmd
+
+
+class ManagedProcessHandle(ABC):
+    """Uniform handle interface for SSH Popen processes and VSOCK RPC sessions."""
+
+    @abstractmethod
+    def poll(self) -> int | None:
+        ...
+
+    @abstractmethod
+    def terminate(self) -> None:
+        ...
+
+    @abstractmethod
+    def wait(self, timeout: float | None = None) -> int | None:
+        ...
+
+    @abstractmethod
+    def kill(self) -> None:
+        ...
+
+
+class PopenHandle(ManagedProcessHandle):
+    """Wraps a `subprocess.Popen` process (optionally terminating its full process group)."""
+
+    def __init__(self, proc: subprocess.Popen, *, use_pgroup: bool = False) -> None:
+        self.proc = proc
+        self.use_pgroup = use_pgroup
+
+    def poll(self) -> int | None:
+        return self.proc.poll()
+
+    def terminate(self) -> None:
+        if self.proc.poll() is None:
+            try:
+                if self.use_pgroup:
+                    os.killpg(self.proc.pid, signal.SIGTERM)
+                else:
+                    self.proc.terminate()
+            except OSError:
+                try:
+                    self.proc.terminate()
+                except OSError:
+                    pass
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        try:
+            return self.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def kill(self) -> None:
+        if self.proc.poll() is None:
+            try:
+                if self.use_pgroup:
+                    os.killpg(self.proc.pid, signal.SIGKILL)
+                else:
+                    self.proc.kill()
+            except OSError:
+                try:
+                    self.proc.kill()
+                except OSError:
+                    pass
+
+
+class VsockSessionHandle(ManagedProcessHandle):
+    """Tracks a long-lived `run` or `start_tray` RPC session over AF_VSOCK."""
+
+    def __init__(self, sock: socket.socket, forward_output: bool = True) -> None:
+        self._sock = sock
+        self._forward_output = forward_output
+        self._exit_code: int | None = None
+        self._done = threading.Event()
+        self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _read_loop(self) -> None:
+        try:
+            with self._sock.makefile("r", encoding="utf-8", errors="replace") as reader:
+                for raw_line in reader:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ev = msg.get("event")
+                    if ev == "stdout" and self._forward_output:
+                        sys.stdout.write(msg.get("data", ""))
+                        sys.stdout.flush()
+                    elif ev == "stderr" and self._forward_output:
+                        sys.stderr.write(msg.get("data", ""))
+                        sys.stderr.flush()
+                    elif ev == "exit":
+                        self._exit_code = int(msg.get("code", 0))
+                        break
+                    elif msg.get("ok") is False:
+                        sys.stderr.write(f"[ERROR] Guest daemon error: {msg.get('error', 'unknown')}\n")
+                        self._exit_code = 1
+                        break
+        except OSError:
+            pass
+        finally:
+            if self._exit_code is None:
+                self._exit_code = 0
+            self._done.set()
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+
+    def poll(self) -> int | None:
+        return self._exit_code if self._done.is_set() else None
+
+    def terminate(self) -> None:
+        try:
+            self._sock.sendall(b'{"op":"terminate"}\n')
+        except OSError:
+            pass
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        self._done.wait(timeout=timeout)
+        return self._exit_code if self._done.is_set() else None
+
+    def kill(self) -> None:
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+
+
+def terminate_handle_cleanly(handle: ManagedProcessHandle | None, timeout: float = 2.0) -> None:
+    """Terminates a process/session handle, waits briefly, and falls back to kill()."""
+    if handle is None:
+        return
+    if handle.poll() is not None:
+        handle.wait(timeout=0.1)
+        return
+    handle.terminate()
+    if handle.wait(timeout=timeout) is None:
+        handle.kill()
+        handle.wait(timeout=1.0)
+
+
+class ControlTransport(ABC):
+    """Abstract control plane for host-to-guest operations."""
+
+    def __init__(self, cfg: RuntimeConfig) -> None:
+        self.cfg = cfg
+
+    @abstractmethod
+    def list_apps(self) -> list[tuple[str, str]]:
+        ...
+
+    @abstractmethod
+    def read_desktop_file(self, app_id: str) -> str | None:
+        ...
+
+    @abstractmethod
+    def fetch_icon(self, icon_name: str) -> tuple[str, bytes] | None:
+        ...
+
+    @abstractmethod
+    def ensure_guest_scripts(self, force: bool = False) -> dict[str, Any]:
+        ...
+
+    @abstractmethod
+    def check_health(self) -> tuple[bool, str]:
+        ...
+
+
+class SSHControlTransport(ControlTransport):
+    """Control plane implemented over non-interactive OpenSSH (`BatchMode=yes`)."""
+
+    def run_command(
+        self,
+        remote_command: str,
+        *,
+        stdin_bytes: bytes | None = None,
+        check: bool = True,
+    ) -> bytes:
+        cmd = _build_ssh_base_cmd(self.cfg.vm_target) + [remote_command]
+        try:
+            result = subprocess.run(
+                cmd,
+                input=stdin_bytes,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=check,
+            )
+            return result.stdout
+        except FileNotFoundError as exc:
+            raise TransportError("OpenSSH client (`ssh`) is not installed on the host.") from exc
+        except subprocess.CalledProcessError as exc:
+            err_msg = exc.stderr.decode("utf-8", errors="replace").strip()
+            raise TransportError(f"SSH command failed on '{self.cfg.vm_target}': {err_msg}") from exc
+
+    def _cache_marker_path(self) -> Path:
+        script_hash = compute_guest_scripts_hash(self.cfg.vsock_control_port)
+        return HOST_CACHE_DIR / f"scripts-{script_hash}-{self.cfg.vm_slug}.json"
+
+    def ensure_guest_scripts(self, force: bool = False) -> dict[str, Any]:
+        HOST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        marker_file = self._cache_marker_path()
+
+        if marker_file.exists() and not force:
+            try:
+                return json.loads(marker_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        bin_dir = GUEST_BIN_DIR
+        self.run_command(
+            f"mkdir -p {bin_dir} && cat > {bin_dir}/{GUEST_WRAPPER_NAME} && chmod 0755 {bin_dir}/{GUEST_WRAPPER_NAME}",
+            stdin_bytes=render_guest_wrapper().encode("utf-8"),
+            check=True,
+        )
+        self.run_command(
+            f"mkdir -p {bin_dir} && cat > {bin_dir}/{GUEST_TRAY_AGENT_NAME} && chmod 0755 {bin_dir}/{GUEST_TRAY_AGENT_NAME}",
+            stdin_bytes=render_guest_tray_agent().encode("utf-8"),
+            check=True,
+        )
+
+        # Query guest runtime dir once (used for clean ssh -R socket placement)
+        rt_out = self.run_command(
+            'printf "%s" "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"',
+            check=False,
+        ).decode("utf-8", errors="replace").strip()
+
+        meta = {
+            "hash": compute_guest_scripts_hash(self.cfg.vsock_control_port),
+            "remote_runtime_dir": rt_out or "/tmp",
+            "deployed_at": int(time.time()),
+        }
+        marker_file.write_text(json.dumps(meta), encoding="utf-8")
+        return meta
+
+    def deploy_guest_control_daemon(self) -> bool:
+        """
+        Installs wayport-daemon, enables its systemd user unit, and attempts to enable
+        systemd user lingering over SSH so the daemon starts on VM boot without login.
+        Returns True if lingering was confirmed/enabled, False otherwise.
+        """
+        bin_dir = GUEST_BIN_DIR
+        self.ensure_guest_scripts(force=True)
+        self.run_command(
+            f"mkdir -p {bin_dir} && cat > {bin_dir}/{GUEST_CONTROL_DAEMON_NAME} && chmod 0755 {bin_dir}/{GUEST_CONTROL_DAEMON_NAME}",
+            stdin_bytes=render_guest_control_daemon(self.cfg.vsock_control_port).encode("utf-8"),
+            check=True,
+        )
+        unit_text = build_guest_daemon_systemd_unit(self.cfg.vsock_control_port)
+        self.run_command(
+            f"mkdir -p ~/.config/systemd/user && cat > ~/.config/systemd/user/{GUEST_SYSTEMD_UNIT_NAME} "
+            f"&& systemctl --user daemon-reload "
+            f"&& systemctl --user enable --now {GUEST_SYSTEMD_UNIT_NAME} "
+            f"&& systemctl --user restart {GUEST_SYSTEMD_UNIT_NAME}",
+            stdin_bytes=unit_text.encode("utf-8"),
+            check=True,
+        )
+        linger_out = self.run_command(
+            'if command -v loginctl >/dev/null 2>&1; then '
+            'loginctl enable-linger "$USER" >/dev/null 2>&1 || true; '
+            'loginctl show-user "$USER" -p Linger 2>/dev/null || true; '
+            'fi',
+            check=False,
+        ).decode("utf-8", errors="replace")
+        return "Linger=yes" in linger_out
+
+    def list_apps(self) -> list[tuple[str, str]]:
+        dirs_json = json.dumps(list(DESKTOP_APP_SEARCH_DIRS))
+        py_code = (
+            "import glob, json, os, sys\n"
+            "dirs = json.loads(sys.argv[1])\n"
+            "seen = set()\n"
+            "out = []\n"
+            "for raw_d in dirs:\n"
+            "  d = os.path.expanduser(raw_d)\n"
+            "  if not os.path.isdir(d): continue\n"
+            "  for path in sorted(glob.glob(os.path.join(d, '*.desktop'))):\n"
+            "    app_id = os.path.basename(path)[:-8]\n"
+            "    if app_id in seen: continue\n"
+            "    with open(path, encoding='utf-8', errors='ignore') as f: txt = f.read()\n"
+            "    if 'NoDisplay=true' in txt or 'Type=Application' not in txt: continue\n"
+            "    name = next((l.split('=', 1)[1].strip() for l in txt.splitlines() if l.startswith('Name=')), 'Unknown')\n"
+            "    seen.add(app_id)\n"
+            "    out.append([app_id, name])\n"
+            "out.sort(key=lambda x: x[0])\n"
+            "print(json.dumps(out))\n"
+        )
+        remote_cmd = f"python3 -c {shlex.quote(py_code)} {shlex.quote(dirs_json)}"
+        raw = self.run_command(remote_cmd).decode("utf-8", errors="replace").strip()
+        if not raw:
+            return []
+        try:
+            return [(str(a), str(b)) for a, b in json.loads(raw)]
+        except json.JSONDecodeError as exc:
+            raise TransportError(f"Malformed application list from '{self.cfg.vm_target}': {exc}") from exc
+
+    def read_desktop_file(self, app_id: str) -> str | None:
+        clean_id = app_id[:-8] if app_id.endswith(".desktop") else app_id
+        dirs_json = json.dumps(list(DESKTOP_APP_SEARCH_DIRS))
+        py_code = (
+            "import json, os, sys\n"
+            "dirs = json.loads(sys.argv[1])\n"
+            "clean_id = sys.argv[2]\n"
+            "if '/' in clean_id or '..' in clean_id: sys.exit(1)\n"
+            "for raw_d in dirs:\n"
+            "  cand = os.path.join(os.path.expanduser(raw_d), clean_id + '.desktop')\n"
+            "  if os.path.isfile(cand):\n"
+            "    with open(cand, 'rb') as f: sys.stdout.buffer.write(f.read())\n"
+            "    sys.exit(0)\n"
+            "sys.exit(2)\n"
+        )
+        remote_cmd = f"python3 -c {shlex.quote(py_code)} {shlex.quote(dirs_json)} {shlex.quote(clean_id)}"
+        raw = self.run_command(remote_cmd, check=False)
+        text = raw.decode("utf-8", errors="replace").strip()
+        return text if text else None
+
+    def fetch_icon(self, icon_name: str) -> tuple[str, bytes] | None:
+        if not icon_name:
+            return None
+        dirs_json = json.dumps(list(ICON_SEARCH_DIRS))
+        py_code = (
+            "import json, os, sys\n"
+            "dirs = json.loads(sys.argv[1])\n"
+            "icon = sys.argv[2]\n"
+            "if os.path.isabs(icon) and os.path.isfile(icon):\n"
+            "  sys.stdout.buffer.write(b'EXT:' + os.path.splitext(icon)[1].encode('ascii') + b'\\n' + open(icon, 'rb').read())\n"
+            "  sys.exit(0)\n"
+            "for raw_d in dirs:\n"
+            "  d = os.path.expanduser(raw_d)\n"
+            "  for ext in ('.svg', '.png', '.xpm'):\n"
+            "    cand = os.path.join(d, icon + ext)\n"
+            "    if os.path.isfile(cand):\n"
+            "      sys.stdout.buffer.write(b'EXT:' + ext.encode('ascii') + b'\\n' + open(cand, 'rb').read())\n"
+            "      sys.exit(0)\n"
+        )
+        remote_cmd = f"python3 -c {shlex.quote(py_code)} {shlex.quote(dirs_json)} {shlex.quote(icon_name)}"
+        raw_data = self.run_command(remote_cmd, check=False)
+        if not raw_data.startswith(b"EXT:") or b"\n" not in raw_data:
+            return None
+        header, icon_bytes = raw_data.split(b"\n", 1)
+        ext = header.decode("ascii", errors="ignore").split(":", 1)[1]
+        return (ext, icon_bytes) if icon_bytes else None
+
+    def check_health(self) -> tuple[bool, str]:
+        try:
+            out = self.run_command("command -v waypipe && uname -m", check=True).decode("utf-8", errors="replace").strip()
+            lines = [line.strip() for line in out.splitlines() if line.strip()]
+            return True, f"SSH reachable ({', '.join(lines)})"
+        except TransportError as exc:
+            return False, str(exc)
+
+
+class VsockControlTransport(ControlTransport):
+    """Control plane over pure AF_VSOCK JSON-RPC to `wayport-daemon` (zero SSH)."""
+
+    def _connect(self, timeout: float = 10.0) -> socket.socket:
+        if self.cfg.vsock_cid is None:
+            raise TransportError("Guest VSOCK CID is not configured.")
+        try:
+            sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((self.cfg.vsock_cid, self.cfg.vsock_control_port))
+            return sock
+        except OSError as exc:
+            raise TransportError(
+                f"Cannot connect to guest AF_VSOCK CID {self.cfg.vsock_cid} port {self.cfg.vsock_control_port}: {exc}. "
+                "Ensure the VM is running, Virtio VSOCK is attached, `wayport-guest.service` is active inside the VM "
+                "(run `wayport install-guest`), and systemd lingering is enabled (`sudo loginctl enable-linger \"$USER\"`) "
+                "if no user is logged into the VM."
+            ) from exc
+
+    def _rpc(self, payload: dict[str, Any], timeout: float = 15.0) -> dict[str, Any]:
+        sock = self._connect(timeout=timeout)
+        try:
+            sock.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+            with sock.makefile("r", encoding="utf-8", errors="replace") as reader:
+                raw_resp = reader.readline()
+            if not raw_resp:
+                raise TransportError("Empty response from guest VSOCK control daemon.")
+            resp = json.loads(raw_resp)
+            if not resp.get("ok"):
+                raise TransportError(resp.get("error", "Guest VSOCK RPC failed"))
+            return resp
+        except json.JSONDecodeError as exc:
+            raise TransportError(f"Invalid JSON from guest VSOCK daemon: {exc}") from exc
+        except OSError as exc:
+            raise TransportError(f"VSOCK RPC I/O error: {exc}") from exc
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def open_session(self, payload: dict[str, Any], *, forward_output: bool = True) -> VsockSessionHandle:
+        sock = self._connect(timeout=10.0)
+        try:
+            sock.settimeout(None)
+            sock.sendall((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
+            return VsockSessionHandle(sock, forward_output=forward_output)
+        except OSError as exc:
+            sock.close()
+            raise TransportError(f"Failed to start VSOCK session: {exc}") from exc
+
+    def _cache_marker_path(self) -> Path:
+        script_hash = compute_guest_scripts_hash(self.cfg.vsock_control_port)
+        return HOST_CACHE_DIR / f"vsock-sync-{script_hash}-{self.cfg.vm_slug}.json"
+
+    def ensure_guest_scripts(self, force: bool = False) -> dict[str, Any]:
+        HOST_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        marker_file = self._cache_marker_path()
+        if marker_file.exists() and not force:
+            try:
+                return json.loads(marker_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        ping_info = self._rpc({"op": "ping"})
+        if ALLOW_VSOCK_SCRIPT_SYNC and ping_info.get("allow_script_sync", True):
+            self._rpc({
+                "op": "sync_scripts",
+                "scripts": {
+                    GUEST_WRAPPER_NAME: render_guest_wrapper(),
+                    GUEST_TRAY_AGENT_NAME: render_guest_tray_agent(),
+                },
+            })
+        meta = {
+            "hash": compute_guest_scripts_hash(self.cfg.vsock_control_port),
+            "remote_runtime_dir": ping_info.get("runtime_dir", "/tmp"),
+            "synced_at": int(time.time()),
+        }
+        marker_file.write_text(json.dumps(meta), encoding="utf-8")
+        return meta
+
+    def list_apps(self) -> list[tuple[str, str]]:
+        resp = self._rpc({"op": "list_apps"})
+        return [(str(item["id"]), str(item["name"])) for item in (resp.get("apps") or [])]
+
+    def read_desktop_file(self, app_id: str) -> str | None:
+        try:
+            resp = self._rpc({"op": "get_desktop", "app_id": app_id})
+            return str(resp.get("content", "")) or None
+        except TransportError:
+            return None
+
+    def fetch_icon(self, icon_name: str) -> tuple[str, bytes] | None:
+        if not icon_name:
+            return None
+        try:
+            resp = self._rpc({"op": "get_icon", "icon_name": icon_name})
+            return str(resp["ext"]), base64.b64decode(resp["b64"])
+        except (TransportError, KeyError, ValueError):
+            return None
+
+    def check_health(self) -> tuple[bool, str]:
+        try:
+            info = self._rpc({"op": "ping"}, timeout=5.0)
+            return True, f"VSOCK guest daemon reachable (version {info.get('version')}, uid {info.get('uid')})"
+        except TransportError as exc:
+            return False, str(exc)
+
+
+def create_control_transport(cfg: RuntimeConfig) -> ControlTransport:
+    if cfg.mode == "vsock":
+        return VsockControlTransport(cfg)
+    return SSHControlTransport(cfg)
+
+
+# ==============================================================================
+# 4. Guest Application Runner (All 3 Transport Modes)
+# ==============================================================================
+
+def needs_chromium_wayland_flags(binary_path: str) -> bool:
+    """Checks if the target executable is a known Chromium or Electron binary."""
+    binary_name = Path(binary_path).name.lower()
+    return any(binary_name.startswith(prefix) for prefix in CHROMIUM_BINARIES)
+
+
+def _wait_for_waypipe_client_socket(
+    sock_path: Path,
+    client_proc: subprocess.Popen,
+    timeout: float = 3.0,
+) -> None:
+    """Waits for host `waypipe client` to create its Unix socket, failing fast if it exits."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if sock_path.exists():
+            return
+        rc = client_proc.poll()
+        if rc is not None:
+            raise TransportError(f"Host `waypipe client` exited prematurely with status {rc}.")
+        time.sleep(0.01)
+    raise TransportError(f"Timed out waiting for host `waypipe client` socket at {sock_path}.")
+
+
+def run_guest_application(cfg: RuntimeConfig, cmd_tokens: list[str], *, start_tray: bool = True) -> int:
+    """Launches a guest GUI application using the configured transport mode."""
+    if not cmd_tokens:
+        raise TransportError("No guest command specified for 'run'.")
+
+    transport = create_control_transport(cfg)
+    meta = transport.ensure_guest_scripts(force=False)
+    if start_tray and AUTO_START_TRAY_ON_RUN:
+        ensure_tray_daemon_running(cfg)
+
+    executable = cmd_tokens[0]
+    app_args = list(cmd_tokens[1:])
+
+    if needs_chromium_wayland_flags(executable):
+        for flag in CHROMIUM_EXTRA_FLAGS:
+            flag_prefix = flag.split("=", 1)[0]
+            if not any(arg == flag_prefix or arg.startswith(flag_prefix + "=") for arg in app_args):
+                app_args.append(flag)
+
+    uid = os.getuid()
+    runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}"))
+    session_token = secrets.token_hex(4)
+    waypipe_sock_path = runtime_dir / f"wayport-client-{os.getpid()}-{session_token}.sock"
+    waypipe_sock_path.unlink(missing_ok=True)
+
+    host_client_cmd = ["waypipe", "-c", cfg.compression]
+    if cfg.no_gpu:
+        host_client_cmd.append("--no-gpu")
+    host_client_cmd.extend(["-s", str(waypipe_sock_path), "client"])
+
+    client_proc = subprocess.Popen(host_client_cmd, start_new_session=True)
+    client_handle = PopenHandle(client_proc, use_pgroup=True)
+
+    listener_sock: socket.socket | None = None
+    proxy_sock_path: Path | None = None
+    guest_handle: ManagedProcessHandle | None = None
+    stop_event = threading.Event()
+
+    def handle_signal(_signum, _frame) -> None:
+        stop_event.set()
+
+    prev_sigterm = signal.signal(signal.SIGTERM, handle_signal)
+    prev_sigint = signal.signal(signal.SIGINT, handle_signal)
+
+    try:
+        _wait_for_waypipe_client_socket(waypipe_sock_path, client_proc)
+
+        if cfg.mode in ("hybrid", "vsock"):
+            listener_sock, vsock_port = create_vsock_listener()
+            threading.Thread(
+                target=accept_and_bridge_loop,
+                args=(listener_sock, str(waypipe_sock_path)),
+                kwargs={"mask_idle_inhibit": cfg.effective_mask_idle_inhibit},
+                daemon=True,
+            ).start()
+
+            if cfg.mode == "vsock":
+                assert isinstance(transport, VsockControlTransport)
+                guest_handle = transport.open_session(
+                    {
+                        "op": "run",
+                        "vsock_port": vsock_port,
+                        "compression": cfg.compression,
+                        "no_gpu": cfg.no_gpu,
+                        "cmd": [executable, *app_args],
+                    },
+                    forward_output=True,
+                )
+            else:
+                quoted_cmd = " ".join(shlex.quote(tok) for tok in [executable, *app_args])
+                gpu_flag = "--no-gpu" if cfg.no_gpu else "--gpu"
+                remote_cmd = (
+                    f"{GUEST_BIN_DIR}/{GUEST_WRAPPER_NAME} "
+                    f"--vsock-port {vsock_port} --compression {shlex.quote(cfg.compression)} "
+                    f"{gpu_flag} -- {quoted_cmd}"
+                )
+                ssh_cmd = _build_ssh_base_cmd(cfg.vm_target, disable_mux=True) + [remote_cmd]
+                guest_handle = PopenHandle(subprocess.Popen(ssh_cmd, stdin=subprocess.DEVNULL))
+        else:
+            # Pure SSH mode: forward a unique remote Unix socket to host proxy or waypipe client
+            local_forward_target = waypipe_sock_path
+            if cfg.effective_mask_idle_inhibit:
+                proxy_sock_path = runtime_dir / f"wayport-proxy-{os.getpid()}-{session_token}.sock"
+                listener_sock = create_unix_listener(proxy_sock_path)
+                threading.Thread(
+                    target=accept_and_bridge_loop,
+                    args=(listener_sock, str(waypipe_sock_path)),
+                    kwargs={"mask_idle_inhibit": True},
+                    daemon=True,
+                ).start()
+                local_forward_target = proxy_sock_path
+
+            remote_rt_dir = str(meta.get("remote_runtime_dir") or "/tmp").rstrip("/")
+            remote_sock = f"{remote_rt_dir}/wayport-ssh-{os.getpid()}-{session_token}.sock"
+            quoted_cmd = " ".join(shlex.quote(tok) for tok in [executable, *app_args])
+            gpu_flag = "--no-gpu" if cfg.no_gpu else "--gpu"
+            remote_cmd = (
+                f"{GUEST_BIN_DIR}/{GUEST_WRAPPER_NAME} "
+                f"--unix-sock {shlex.quote(remote_sock)} --compression {shlex.quote(cfg.compression)} "
+                f"{gpu_flag} -- {quoted_cmd}"
+            )
+            ssh_cmd = _build_ssh_base_cmd(
+                cfg.vm_target,
+                disable_mux=True,
+                extra_args=[
+                    "-o",
+                    "ExitOnForwardFailure=yes",
+                    "-R",
+                    f"{remote_sock}:{local_forward_target}",
+                ],
+            ) + [remote_cmd]
+            guest_handle = PopenHandle(subprocess.Popen(ssh_cmd, stdin=subprocess.DEVNULL))
+
+        while not stop_event.is_set():
+            if guest_handle.poll() is not None or client_handle.poll() is not None:
+                break
+            time.sleep(0.05)
+
+        rc = guest_handle.poll()
+        return int(rc) if rc is not None else 0
+    finally:
+        signal.signal(signal.SIGTERM, prev_sigterm)
+        signal.signal(signal.SIGINT, prev_sigint)
+        if listener_sock is not None:
+            try:
+                listener_sock.close()
+            except OSError:
+                pass
+        terminate_handle_cleanly(guest_handle)
+        terminate_handle_cleanly(client_handle)
+        waypipe_sock_path.unlink(missing_ok=True)
+        if proxy_sock_path is not None:
+            proxy_sock_path.unlink(missing_ok=True)
+
+
+# ==============================================================================
+# 5. Host-Side System Tray & Notification Daemon (`tray-daemon`, All 3 Modes)
+# ==============================================================================
+
+def sync_theme_files_safe(
+    target_dir: Path,
+    theme_files: dict[str, str],
+) -> str:
+    """Safely writes base64-encoded theme icon files inside `target_dir`, rejecting path traversal."""
+    if not theme_files:
+        return ""
+    target_dir.mkdir(parents=True, exist_ok=True)
+    resolved_root = target_dir.resolve()
+    for rel_path, b64_data in theme_files.items():
+        safe_rel = Path(rel_path)
+        if safe_rel.is_absolute() or ".." in safe_rel.parts:
+            continue
+        dest = (resolved_root / safe_rel).resolve()
+        if not dest.is_relative_to(resolved_root) or dest == resolved_root:
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            dest.write_bytes(base64.b64decode(b64_data))
+        except Exception:
+            pass
+    return str(resolved_root)
+
+
+def run_host_tray_daemon(cfg: RuntimeConfig) -> None:
+    """
+    Runs the host-side KDE StatusNotifierItem, DbusMenu & Notification bridge daemon.
+    Supports `hybrid` (AF_VSOCK + SSH trigger), `vsock` (pure AF_VSOCK), and `ssh` (stdio).
+    """
+    import dbus
+    import dbus.service
+    from dbus.mainloop.glib import DBusGMainLoop
+    from gi.repository import GLib
+
+    DBusGMainLoop(set_as_default=True)
+    vm_label = cfg.vm_label
+    transport = create_control_transport(cfg)
+
+    SNW_BUS_NAME = "org.kde.StatusNotifierWatcher"
+    SNW_OBJ_PATH = "/StatusNotifierWatcher"
+    SNW_IFACE = "org.kde.StatusNotifierWatcher"
+    SNI_IFACE = "org.kde.StatusNotifierItem"
+    DBUSMENU_IFACE = "com.canonical.dbusmenu"
+
+    NOTIF_BUS_NAME = "org.freedesktop.Notifications"
+    NOTIF_OBJ_PATH = "/org/freedesktop/Notifications"
+    NOTIF_IFACE = "org.freedesktop.Notifications"
+
+    def pack_pixmap_array(px_list: list[dict]) -> dbus.Array:
+        arr = dbus.Array([], signature="(iiay)")
+        for item in px_list or []:
+            try:
+                raw_bytes = base64.b64decode(item["b64"])
+                arr.append(
+                    dbus.Struct(
+                        (dbus.Int32(item["w"]), dbus.Int32(item["h"]), dbus.ByteArray(raw_bytes)),
+                        signature="iiay",
+                    )
+                )
+            except Exception:
+                continue
+        return arr
+
+    def unpack_menu_variant(tagged: dict):
+        t = tagged.get("t", "s")
+        v = tagged.get("v")
+        if t == "b":
+            return dbus.Boolean(bool(v), variant_level=1)
+        if t == "i":
+            return dbus.Int32(int(v), variant_level=1)
+        if t == "ay":
+            return dbus.ByteArray(base64.b64decode(v), variant_level=1)
+        if t == "aas":
+            outer = dbus.Array([], signature="as", variant_level=1)
+            for row in v or []:
+                outer.append(dbus.Array([dbus.String(s) for s in row], signature="s"))
+            return outer
+        return dbus.String(str(v if v is not None else ""), variant_level=1)
+
+    def build_dbusmenu_struct(node: dict, is_root: bool = True) -> dbus.Struct:
+        item_id = dbus.Int32(node.get("id", 0))
+        props = dbus.Dictionary({}, signature="sv")
+        for k, tagged_val in node.get("props", {}).items():
+            props[dbus.String(k)] = unpack_menu_variant(tagged_val)
+
+        children = dbus.Array(
+            [build_dbusmenu_struct(c, is_root=False) for c in node.get("children", [])],
+            signature="v",
+        )
+        return dbus.Struct(
+            (item_id, props, children),
+            signature="ia{sv}av",
+            variant_level=0 if is_root else 1,
+        )
+
+    def find_menu_subtree(node: dict, target_id: int) -> dict | None:
+        if node.get("id", 0) == target_id:
+            return node
+        for child in node.get("children", []):
+            found = find_menu_subtree(child, target_id)
+            if found is not None:
+                return found
+        return None
+
+    class HostDbusMenuObject(dbus.service.Object):
+        def __init__(self, conn: dbus.Bus, item_key: str, send_fn) -> None:
+            super().__init__(conn, "/MenuBar")
+            self.item_key = item_key
+            self.send_fn = send_fn
+            self.revision = 1
+            self.root_node = {"id": 0, "props": {"children-display": {"t": "s", "v": "submenu"}}, "children": []}
+
+        def update_menu(self, menu_data: dict | None) -> None:
+            if not menu_data or "root" not in menu_data:
+                return
+            self.revision = int(menu_data.get("revision", self.revision + 1))
+            self.root_node = menu_data["root"]
+            self.LayoutUpdated(dbus.UInt32(self.revision), dbus.Int32(0))
+
+        @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="ss", out_signature="v")
+        def Get(self, interface_name: str, property_name: str):
+            return self.GetAll(interface_name).get(property_name, dbus.String("", variant_level=1))
+
+        @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="s", out_signature="a{sv}")
+        def GetAll(self, interface_name: str) -> dbus.Dictionary:
+            if interface_name == DBUSMENU_IFACE:
+                return dbus.Dictionary(
+                    {
+                        "Version": dbus.UInt32(3, variant_level=1),
+                        "TextDirection": dbus.String("ltr", variant_level=1),
+                        "Status": dbus.String("normal", variant_level=1),
+                        "IconThemePath": dbus.Array([], signature="s", variant_level=1),
+                    },
+                    signature="sv",
+                )
+            return dbus.Dictionary({}, signature="sv")
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="iias", out_signature="u(ia{sv}av)")
+        def GetLayout(self, parent_id: int, recursion_depth: int, property_names: list):
+            target = find_menu_subtree(self.root_node, int(parent_id)) or self.root_node
+            return dbus.UInt32(self.revision), build_dbusmenu_struct(target, is_root=True)
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="aias", out_signature="a(ia{sv})")
+        def GetGroupProperties(self, ids: list, property_names: list):
+            result = dbus.Array([], signature="(ia{sv})")
+            for req_id in ids:
+                node = find_menu_subtree(self.root_node, int(req_id))
+                if node:
+                    props = dbus.Dictionary({}, signature="sv")
+                    for k, tagged_val in node.get("props", {}).items():
+                        props[dbus.String(k)] = unpack_menu_variant(tagged_val)
+                    result.append(dbus.Struct((dbus.Int32(req_id), props), signature="ia{sv}"))
+            return result
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="is", out_signature="v")
+        def GetProperty(self, item_id: int, name: str):
+            node = find_menu_subtree(self.root_node, int(item_id))
+            if node and name in node.get("props", {}):
+                return unpack_menu_variant(node["props"][name])
+            return dbus.String("", variant_level=1)
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="isvu", out_signature="")
+        def Event(self, item_id: int, event_id: str, data, timestamp: int) -> None:
+            if str(event_id) == "clicked":
+                self.send_fn({
+                    "cmd": "MenuEvent",
+                    "key": self.item_key,
+                    "menu_id": int(item_id),
+                    "event_id": "clicked",
+                    "timestamp": int(timestamp),
+                })
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="a(isvu)", out_signature="ai")
+        def EventGroup(self, events: list):
+            for ev in events:
+                try:
+                    item_id, event_id, _, timestamp = int(ev[0]), str(ev[1]), ev[2], int(ev[3])
+                    if event_id == "clicked":
+                        self.send_fn({
+                            "cmd": "MenuEvent",
+                            "key": self.item_key,
+                            "menu_id": item_id,
+                            "event_id": "clicked",
+                            "timestamp": timestamp,
+                        })
+                except Exception:
+                    continue
+            return dbus.Array([], signature="i")
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="i", out_signature="b")
+        def AboutToShow(self, item_id: int) -> dbus.Boolean:
+            self.send_fn({"cmd": "AboutToShow", "key": self.item_key, "menu_id": int(item_id)})
+            return dbus.Boolean(False)
+
+        @dbus.service.method(DBUSMENU_IFACE, in_signature="ai", out_signature="aiai")
+        def AboutToShowGroup(self, ids: list):
+            for i in ids:
+                self.send_fn({"cmd": "AboutToShow", "key": self.item_key, "menu_id": int(i)})
+            return dbus.Array([], signature="i"), dbus.Array([], signature="i")
+
+        @dbus.service.signal(DBUSMENU_IFACE, signature="ui")
+        def LayoutUpdated(self, revision: int, parent: int) -> None:
+            pass
+
+        @dbus.service.signal(DBUSMENU_IFACE, signature="a(ia{sv})a(ias)")
+        def ItemsPropertiesUpdated(self, updated_props, removed_props) -> None:
+            pass
+
+    class HostSNIObject(dbus.service.Object):
+        def __init__(self, conn: dbus.Bus, item_key: str, state: dict, send_fn) -> None:
+            super().__init__(conn, "/StatusNotifierItem")
+            self.item_key = item_key
+            self.send_fn = send_fn
+            self.host_theme_dir = ""
+            self.state: dict = {}
+            self.apply_state(state, emit_signals=False)
+
+        def sync_theme_files(self, state: dict) -> str:
+            if "ThemeFiles" not in state:
+                return self.host_theme_dir
+            theme_files = state.get("ThemeFiles") or {}
+            if not theme_files:
+                return ""
+            key_hash = hashlib.sha1(f"{vm_label}:{self.item_key}".encode("utf-8")).hexdigest()[:12]
+            return sync_theme_files_safe(HOST_TRAY_ICONS_DIR / key_hash, theme_files)
+
+        def apply_state(self, new_state: dict, emit_signals: bool = True) -> None:
+            self.host_theme_dir = self.sync_theme_files(new_state)
+            self.state = new_state
+            if emit_signals:
+                self.NewIcon()
+                self.NewAttentionIcon()
+                self.NewOverlayIcon()
+                self.NewTitle()
+                self.NewToolTip()
+                self.NewStatus(dbus.String(self.state.get("Status") or "Active"))
+
+        def build_properties(self) -> dbus.Dictionary:
+            raw_name = self.state.get("Title") or self.state.get("Id") or "VM Application"
+            title_raw = re.sub(r"_status_icon_\d+$", "", raw_name)
+            badge_title = format_badge(title_raw, vm_label)
+
+            tt = self.state.get("ToolTip") or {}
+            tt_title = format_badge(re.sub(r"_status_icon_\d+$", "", tt.get("title") or title_raw), vm_label)
+
+            tt_struct = dbus.Struct(
+                (
+                    dbus.String(tt.get("icon_name") or ""),
+                    pack_pixmap_array(tt.get("pixmaps") or []),
+                    dbus.String(tt_title),
+                    dbus.String(tt.get("desc") or ""),
+                ),
+                signature="sa(iiay)ss",
+                variant_level=1,
+            )
+
+            has_menu = bool(self.state.get("MenuPath"))
+            key_hash = hashlib.sha1(f"{vm_label}:{self.item_key}".encode("utf-8")).hexdigest()[:8]
+
+            props = {
+                "Category": dbus.String(self.state.get("Category") or "ApplicationStatus", variant_level=1),
+                "Id": dbus.String(f"vm_{key_hash}_{self.state.get('Id', 'app')}", variant_level=1),
+                "Title": dbus.String(badge_title, variant_level=1),
+                "Status": dbus.String(self.state.get("Status") or "Active", variant_level=1),
+                "WindowId": dbus.Int32(int(self.state.get("WindowId") or 0), variant_level=1),
+                "IconThemePath": dbus.String(self.host_theme_dir, variant_level=1),
+                "IconName": dbus.String(self.state.get("IconName") or "", variant_level=1),
+                "IconPixmap": pack_pixmap_array(self.state.get("IconPixmap") or []),
+                "OverlayIconName": dbus.String(self.state.get("OverlayIconName") or "", variant_level=1),
+                "OverlayIconPixmap": pack_pixmap_array(self.state.get("OverlayIconPixmap") or []),
+                "AttentionIconName": dbus.String(self.state.get("AttentionIconName") or "", variant_level=1),
+                "AttentionIconPixmap": pack_pixmap_array(self.state.get("AttentionIconPixmap") or []),
+                "AttentionMovieName": dbus.String(self.state.get("AttentionMovieName") or "", variant_level=1),
+                "ToolTip": tt_struct,
+                "ItemIsMenu": dbus.Boolean(bool(self.state.get("ItemIsMenu", False)), variant_level=1),
+                "Menu": dbus.ObjectPath("/MenuBar" if has_menu else "/NO_DBUSMENU", variant_level=1),
+            }
+            return dbus.Dictionary(props, signature="sv")
+
+        @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="ss", out_signature="v")
+        def Get(self, interface_name: str, property_name: str):
+            if interface_name == SNI_IFACE:
+                props = self.build_properties()
+                if property_name in props:
+                    return props[property_name]
+            return dbus.String("", variant_level=1)
+
+        @dbus.service.method(dbus.PROPERTIES_IFACE, in_signature="s", out_signature="a{sv}")
+        def GetAll(self, interface_name: str) -> dbus.Dictionary:
+            if interface_name == SNI_IFACE:
+                return self.build_properties()
+            return dbus.Dictionary({}, signature="sv")
+
+        @dbus.service.method(SNI_IFACE, in_signature="ii", out_signature="")
+        def Activate(self, x: int, y: int) -> None:
+            self.send_fn({"cmd": "Activate", "key": self.item_key, "x": int(x), "y": int(y)})
+
+        @dbus.service.method(SNI_IFACE, in_signature="ii", out_signature="")
+        def SecondaryActivate(self, x: int, y: int) -> None:
+            self.send_fn({"cmd": "SecondaryActivate", "key": self.item_key, "x": int(x), "y": int(y)})
+
+        @dbus.service.method(SNI_IFACE, in_signature="ii", out_signature="")
+        def ContextMenu(self, x: int, y: int) -> None:
+            self.send_fn({"cmd": "ContextMenu", "key": self.item_key, "x": int(x), "y": int(y)})
+
+        @dbus.service.method(SNI_IFACE, in_signature="is", out_signature="")
+        def Scroll(self, delta: int, orientation: str) -> None:
+            self.send_fn({"cmd": "Scroll", "key": self.item_key, "delta": int(delta), "orientation": str(orientation)})
+
+        @dbus.service.method(SNI_IFACE, in_signature="s", out_signature="")
+        def ProvideXdgActivationToken(self, token: str) -> None:
+            self.send_fn({"cmd": "ProvideXdgActivationToken", "key": self.item_key, "token": str(token)})
+
+        @dbus.service.signal(SNI_IFACE, signature="")
+        def NewTitle(self) -> None:
+            pass
+
+        @dbus.service.signal(SNI_IFACE, signature="")
+        def NewIcon(self) -> None:
+            pass
+
+        @dbus.service.signal(SNI_IFACE, signature="")
+        def NewAttentionIcon(self) -> None:
+            pass
+
+        @dbus.service.signal(SNI_IFACE, signature="")
+        def NewOverlayIcon(self) -> None:
+            pass
+
+        @dbus.service.signal(SNI_IFACE, signature="")
+        def NewToolTip(self) -> None:
+            pass
+
+        @dbus.service.signal(SNI_IFACE, signature="s")
+        def NewStatus(self, status: str) -> None:
+            pass
+
+    class HostProxiedTrayItem:
+        _counter = 0
+
+        def __init__(self, item_key: str, state: dict, menu_data: dict | None, send_fn) -> None:
+            HostProxiedTrayItem._counter += 1
+            self.conn = dbus.SessionBus(private=True)
+            self.bus_name_str = f"org.kde.StatusNotifierItem-{os.getpid()}-{HostProxiedTrayItem._counter}"
+            self.bus_name = dbus.service.BusName(self.bus_name_str, bus=self.conn)
+            self.sni_obj = HostSNIObject(self.conn, item_key, state, send_fn)
+            self.menu_obj = HostDbusMenuObject(self.conn, item_key, send_fn)
+            if menu_data:
+                self.menu_obj.update_menu(menu_data)
+            self.register_with_host_watcher()
+
+        def register_with_host_watcher(self) -> None:
+            try:
+                watcher = self.conn.get_object(SNW_BUS_NAME, SNW_OBJ_PATH)
+                dbus.Interface(watcher, SNW_IFACE).RegisterStatusNotifierItem(self.bus_name_str)
+            except Exception as exc:
+                print(f"[TRAY-WARN] Failed to register with host StatusNotifierWatcher: {exc}", file=sys.stderr)
+
+        def close(self) -> None:
+            try:
+                self.sni_obj.remove_from_connection()
+                self.menu_obj.remove_from_connection()
+                del self.bus_name
+                self.conn.close()
+            except Exception:
+                pass
+
+    class HostTrayBridgeManager:
+        def __init__(self) -> None:
+            self.host_bus = dbus.SessionBus()
+            self.proxied_items: dict[str, HostProxiedTrayItem] = {}
+            self.active_writer: Any = None
+            self.write_lock = threading.Lock()
+            self.stop_event = threading.Event()
+
+        def send_to_guest(self, payload: dict) -> None:
+            line = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+            with self.write_lock:
+                writer = self.active_writer
+                if writer is None:
+                    return
+                try:
+                    if isinstance(writer, socket.socket):
+                        writer.sendall(line)
+                    else:
+                        writer.write(line)
+                        writer.flush()
+                except Exception:
+                    pass
+
+        def forward_notification_to_host(self, msg: dict) -> None:
+            try:
+                notif_obj = self.host_bus.get_object(NOTIF_BUS_NAME, NOTIF_OBJ_PATH)
+                notif_iface = dbus.Interface(notif_obj, NOTIF_IFACE)
+                app_name = format_badge(msg.get("app_name") or "VM App", vm_label)
+                notif_iface.Notify(
+                    dbus.String(app_name),
+                    dbus.UInt32(0),
+                    dbus.String(msg.get("app_icon") or ""),
+                    dbus.String(msg.get("summary") or app_name),
+                    dbus.String(msg.get("body") or ""),
+                    dbus.Array([], signature="s"),
+                    dbus.Dictionary({}, signature="sv"),
+                    dbus.Int32(int(msg.get("timeout", -1))),
+                )
+            except Exception as exc:
+                print(f"[TRAY-WARN] Failed to forward notification to host: {exc}", file=sys.stderr)
+
+        def handle_guest_message(self, msg: dict) -> bool:
+            ev = msg.get("event")
+            if ev == "notify":
+                self.forward_notification_to_host(msg)
+                return False
+
+            key = msg.get("key", "")
+            if not key:
+                return False
+
+            if ev == "item_added":
+                if key in self.proxied_items:
+                    self.proxied_items.pop(key).close()
+                state = msg.get("state") or {}
+                menu = msg.get("menu")
+                self.proxied_items[key] = HostProxiedTrayItem(key, state, menu, self.send_to_guest)
+                print(f"[TRAY] Mirrored VM tray icon ({cfg.mode}): '{state.get('Title') or state.get('Id')}' ({key})")
+            elif ev == "item_updated":
+                item = self.proxied_items.get(key)
+                if item and "state" in msg:
+                    item.sni_obj.apply_state(msg["state"], emit_signals=True)
+            elif ev == "menu_updated":
+                item = self.proxied_items.get(key)
+                if item and "menu" in msg:
+                    item.menu_obj.update_menu(msg["menu"])
+            elif ev == "item_removed":
+                item = self.proxied_items.pop(key, None)
+                if item:
+                    item.close()
+                    print(f"[TRAY] Removed VM tray icon from host: {key}")
+            return False
+
+        def clear_all_items(self) -> bool:
+            for key in list(self.proxied_items.keys()):
+                self.proxied_items.pop(key).close()
+            return False
+
+        def _consume_tray_lines(self, reader) -> None:
+            for raw_line in reader:
+                if self.stop_event.is_set():
+                    break
+                if isinstance(raw_line, bytes):
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                else:
+                    line = raw_line.strip()
+                if line.startswith("TRAY_JSON:"):
+                    try:
+                        payload = json.loads(line[10:])
+                        GLib.idle_add(self.handle_guest_message, payload)
+                    except json.JSONDecodeError:
+                        continue
+
+        def _worker_ssh_stdio(self) -> None:
+            print(f"[TRAY] Starting pure-SSH stdio tray bridge for '{cfg.vm_target}'...")
+            while not self.stop_event.is_set():
+                proc: subprocess.Popen | None = None
+                try:
+                    transport.ensure_guest_scripts(force=False)
+                    ssh_cmd = _build_ssh_base_cmd(cfg.vm_target, disable_mux=True) + [
+                        f"{GUEST_BIN_DIR}/{GUEST_TRAY_AGENT_NAME} --stdio"
+                    ]
+                    proc = subprocess.Popen(
+                        ssh_cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=sys.stderr,
+                    )
+                    assert proc.stdin is not None and proc.stdout is not None
+                    with self.write_lock:
+                        self.active_writer = proc.stdin
+                    print(f"[TRAY] Connected to guest tray agent via SSH stdio ({cfg.vm_target})")
+                    self._consume_tray_lines(proc.stdout)
+                except Exception as exc:
+                    print(f"[TRAY-WARN] SSH tray session ended: {exc}", file=sys.stderr)
+                finally:
+                    with self.write_lock:
+                        self.active_writer = None
+                    if proc is not None:
+                        terminate_handle_cleanly(PopenHandle(proc))
+                    GLib.idle_add(self.clear_all_items)
+                self.stop_event.wait(TRAY_RECONNECT_DELAY_SEC)
+
+        def _worker_vsock(self) -> None:
+            server_sock = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
+            server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                server_sock.bind((VMADDR_CID_ANY, cfg.vsock_tray_port))
+                server_sock.listen(4)
+            except OSError as exc:
+                print(
+                    f"[TRAY-ERROR] Cannot bind host AF_VSOCK port {cfg.vsock_tray_port}: {exc}. "
+                    "Another wayport-tray-*.service may already use this port (stop it or pass --tray-port <PORT>).",
+                    file=sys.stderr,
+                )
+                server_sock.close()
+                GLib.idle_add(loop.quit)
+                return
+            server_sock.settimeout(TRAY_ACCEPT_TIMEOUT_SEC)
+            print(f"[TRAY] Listening on host AF_VSOCK (CID ANY, port {cfg.vsock_tray_port}, mode={cfg.mode})...")
+
+            try:
+                while not self.stop_event.is_set():
+                    trigger_handle: ManagedProcessHandle | None = None
+                    conn: socket.socket | None = None
+                    try:
+                        transport.ensure_guest_scripts(force=False)
+                        if cfg.mode == "vsock":
+                            assert isinstance(transport, VsockControlTransport)
+                            trigger_handle = transport.open_session(
+                                {"op": "start_tray", "vsock_port": cfg.vsock_tray_port},
+                                forward_output=True,
+                            )
+                        else:
+                            ssh_cmd = _build_ssh_base_cmd(cfg.vm_target, disable_mux=True) + [
+                                f"{GUEST_BIN_DIR}/{GUEST_TRAY_AGENT_NAME} --vsock {cfg.vsock_tray_port}"
+                            ]
+                            trigger_handle = PopenHandle(
+                                subprocess.Popen(
+                                    ssh_cmd,
+                                    stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=sys.stderr,
+                                )
+                            )
+
+                        conn, addr = server_sock.accept()
+                        print(f"[TRAY] Accepted AF_VSOCK tray connection from guest CID {addr[0]}:{addr[1]}")
+                        with self.write_lock:
+                            self.active_writer = conn
+
+                        with conn.makefile("r", encoding="utf-8", errors="replace") as reader:
+                            self._consume_tray_lines(reader)
+                    except socket.timeout:
+                        print("[TRAY-WARN] Timed out waiting for guest AF_VSOCK connection.", file=sys.stderr)
+                    except Exception as exc:
+                        print(f"[TRAY-WARN] VSOCK tray session ended: {exc}", file=sys.stderr)
+                    finally:
+                        with self.write_lock:
+                            self.active_writer = None
+                        if conn is not None:
+                            try:
+                                conn.close()
+                            except OSError:
+                                pass
+                        terminate_handle_cleanly(trigger_handle)
+                        GLib.idle_add(self.clear_all_items)
+                    self.stop_event.wait(TRAY_RECONNECT_DELAY_SEC)
+            finally:
+                try:
+                    server_sock.close()
+                except OSError:
+                    pass
+
+        def run_worker(self) -> None:
+            if cfg.mode == "ssh":
+                self._worker_ssh_stdio()
+            else:
+                self._worker_vsock()
+
+    manager = HostTrayBridgeManager()
+    loop = GLib.MainLoop()
+
+    def handle_stop(_signum, _frame) -> None:
+        manager.stop_event.set()
+        GLib.idle_add(manager.clear_all_items)
+        GLib.idle_add(loop.quit)
+
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+
+    threading.Thread(target=manager.run_worker, daemon=True).start()
+    try:
+        loop.run()
+    except KeyboardInterrupt:
+        manager.stop_event.set()
+        manager.clear_all_items()
+
+
+# ==============================================================================
+# 6. Host & Guest Systemd Units, Application Listing, Exporting, and Removal
+# ==============================================================================
+
+def build_guest_daemon_systemd_unit(control_port: int = VSOCK_CONTROL_PORT) -> str:
+    return (
+        "[Unit]\n"
+        "Description=wayport Pure-VSOCK Guest Control Daemon\n"
+        "Wants=dbus.socket\n"
+        "After=dbus.socket\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "Environment=PYTHONUNBUFFERED=1\n"
+        f"ExecStart=%h/.local/bin/{GUEST_CONTROL_DAEMON_NAME} --port {int(control_port)}\n"
+        "Restart=always\n"
+        "RestartSec=2\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+
+
+def setup_host_tray_systemd_service(cfg: RuntimeConfig) -> None:
+    """Creates, enables, and restarts the per-target host systemd user service for the tray bridge."""
+    HOST_SYSTEMD_USER_DIR.mkdir(parents=True, exist_ok=True)
+    service_name = cfg.systemd_service_name
+    service_path = HOST_SYSTEMD_USER_DIR / service_name
+
+    exec_args = [SCRIPT_ABS_PATH, *cfg.cli_target_args(), "tray-daemon"]
+    exec_start = " ".join(shlex.quote(arg) for arg in exec_args)
+
+    unit_content = (
+        "[Unit]\n"
+        f"Description=wayport System Tray & Notification Bridge ({cfg.vm_label}, mode={cfg.mode})\n"
+        "After=graphical-session.target\n"
+        "PartOf=graphical-session.target\n\n"
+        "[Service]\n"
+        "Type=simple\n"
+        "Environment=PYTHONUNBUFFERED=1\n"
+        f"ExecStart={exec_start}\n"
+        "Restart=always\n"
+        f"RestartSec={int(TRAY_RECONNECT_DELAY_SEC)}\n\n"
+        "[Install]\n"
+        "WantedBy=graphical-session.target\n"
+    )
+
+    service_path.write_text(unit_content, encoding="utf-8")
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "--user", "enable", "--now", service_name], check=False)
+    subprocess.run(["systemctl", "--user", "restart", service_name], check=False)
+
+
+def _extract_unit_vsock_tray_port(unit_text: str) -> int | None:
+    """Returns the AF_VSOCK tray port used by a systemd unit, or None if it runs in ssh mode."""
+    if "mode=ssh" in unit_text or "--mode ssh" in unit_text:
+        return None
+    m = re.search(r"--tray-port\s+(\d+)", unit_text)
+    return int(m.group(1)) if m else VSOCK_TRAY_PORT
+
+
+def find_conflicting_active_tray_service(
+    cfg: RuntimeConfig,
+    *,
+    systemd_dir: Path | None = None,
+) -> str | None:
+    """
+    Returns the name of another active `wayport-tray-*.service` bound to the same
+    AF_VSOCK tray port, so a one-off `run` does not spawn a colliding unit.
+    """
+    if cfg.mode not in ("hybrid", "vsock"):
+        return None
+    unit_dir = systemd_dir or HOST_SYSTEMD_USER_DIR
+    if not unit_dir.is_dir() or not shutil.which("systemctl"):
+        return None
+    for unit_path in sorted(unit_dir.glob("wayport-tray-*.service")):
+        if unit_path.name == cfg.systemd_service_name:
+            continue
+        try:
+            text = unit_path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if _extract_unit_vsock_tray_port(text) != cfg.vsock_tray_port:
+            continue
+        res = subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", unit_path.name],
+            check=False,
+        )
+        if res.returncode == 0:
+            return unit_path.name
+    return None
+
+
+def ensure_tray_daemon_running(cfg: RuntimeConfig) -> None:
+    """
+    Ensures a host tray bridge service is active for this VM without clobbering
+    an already-running unit's mode or spawning a conflicting AF_VSOCK listener.
+    """
+    if not shutil.which("systemctl"):
+        return
+
+    res = subprocess.run(
+        ["systemctl", "--user", "is-active", "--quiet", cfg.systemd_service_name],
+        check=False,
+    )
+    if res.returncode == 0:
+        return
+
+    conflict = find_conflicting_active_tray_service(cfg)
+    if conflict is not None:
+        print(
+            f"[TRAY-NOTE] Active tray service '{conflict}' already owns AF_VSOCK port {cfg.vsock_tray_port}; "
+            "skipping duplicate tray service creation (pass --tray-port <PORT> for a separate VM).",
+            file=sys.stderr,
+        )
+        return
+
+    setup_host_tray_systemd_service(cfg)
+
+
+def format_badge(name: str, vm_label: str) -> str:
+    """Appends the VM badge if not already present."""
+    badge_marker = f"[{vm_label}]"
+    if badge_marker in name or vm_label in name:
+        return name
+    return DESKTOP_BADGE_FORMAT.format(name=name, vm=vm_label)
+
+
+def _quote_desktop_exec_arg(arg: str) -> str:
+    """Quotes an argument according to the Freedesktop Desktop Entry Exec specification."""
+    reserved = set(' \t\n"\'\\><~|&;$*?#()`')
+    if not arg or any(ch in reserved for ch in arg):
+        escaped = (
+            arg.replace("\\", "\\\\")
+            .replace('"', '\\"')
+            .replace("$", "\\$")
+            .replace("`", "\\`")
+        )
+        return f'"{escaped}"'
+    return arg
+
+
+def rewrite_exec_line(original_exec: str, cfg: RuntimeConfig) -> str:
+    """Rewrites a guest `.desktop` Exec= line to invoke `wayport ... run -- <cmd>`."""
+    # Preserve literal %% while inspecting field codes
+    placeholder = "\x00PERCENT\x00"
+    working = original_exec.replace("%%", placeholder)
+    has_url_code = bool(re.search(r"%[uU]", working))
+    has_file_code = bool(re.search(r"%[fF]", working))
+
+    tokens = shlex.split(working)
+    filtered: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        # Drop file/URL option flags (e.g. `--open-file %U`, `--open-url %U`) that
+        # become dangling when the field code is stripped or expanded to empty.
+        if (
+            tok in ("--open-file", "--open-url")
+            and i + 1 < len(tokens)
+            and re.fullmatch(r"%[fFuU]", tokens[i + 1])
+        ):
+            i += 2
+            continue
+        cleaned_tok = re.sub(r"%[fFuUdDnNickvm]", "", tok).replace(placeholder, "%%")
+        if cleaned_tok:
+            filtered.append(cleaned_tok)
+        i += 1
+
+    if filtered and filtered[0] == "env":
+        filtered.pop(0)
+        while filtered and "=" in filtered[0] and not filtered[0].startswith("-"):
+            filtered.pop(0)
+
+    prefix_tokens = [SCRIPT_ABS_PATH, *cfg.cli_target_args(), "run", "--"]
+    full_tokens = prefix_tokens + filtered
+    rewritten = " ".join(_quote_desktop_exec_arg(tok) for tok in full_tokens)
+    if has_url_code:
+        rewritten += " %U"
+    elif has_file_code:
+        rewritten += " %F"
+    return rewritten
+
+
+def save_guest_icon(cfg: RuntimeConfig, transport: ControlTransport, icon_name: str) -> str:
+    """Fetches an application icon via the active transport and stores it in HOST_ICONS_DIR."""
+    if not icon_name:
+        return "application-x-executable"
+    fetched = transport.fetch_icon(icon_name)
+    if fetched is None:
+        return icon_name
+
+    ext, icon_bytes = fetched
+    HOST_ICONS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_icon_id = re.sub(r"[^a-zA-Z0-9._-]+", "-", Path(icon_name).stem).strip("-.") or "icon"
+    local_icon_path = HOST_ICONS_DIR / f"wayport-{cfg.vm_slug}-{safe_icon_id}{ext}"
+    local_icon_path.write_bytes(icon_bytes)
+    return str(local_icon_path)
+
+
+def transform_desktop_file(
+    raw_content: str,
+    cfg: RuntimeConfig,
+    resolved_icon: str,
+) -> str:
+    """Transforms a guest `.desktop` file so it launches cleanly from the host DE."""
+    lines = raw_content.splitlines()
+    output_lines: list[str] = []
+    current_section = ""
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current_section = stripped
+            output_lines.append(line)
+            continue
+
+        if stripped.startswith(("TryExec=", "Path=")):
+            continue
+
+        if stripped.startswith("DBusActivatable="):
+            output_lines.append("DBusActivatable=false")
+            continue
+
+        if current_section == "[Desktop Entry]" and re.match(r"^Name(\[[^\]]+\])?=", stripped):
+            key, val = stripped.split("=", 1)
+            output_lines.append(f"{key}={format_badge(val, cfg.vm_label)}")
+            continue
+
+        if stripped.startswith("Exec="):
+            _, orig_cmd = stripped.split("=", 1)
+            output_lines.append(f"Exec={rewrite_exec_line(orig_cmd, cfg)}")
+            continue
+
+        if current_section == "[Desktop Entry]" and stripped.startswith("Icon="):
+            output_lines.append(f"Icon={resolved_icon}")
+            continue
+
+        output_lines.append(line)
+
+    return "\n".join(output_lines) + "\n"
+
+
+def extract_desktop_entry_icon(raw_content: str) -> str:
+    """Extracts the Icon= value specifically from the [Desktop Entry] section."""
+    current_section = ""
+    for line in raw_content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current_section = stripped
+            continue
+        if current_section == "[Desktop Entry]" and stripped.startswith("Icon="):
+            return stripped.split("=", 1)[1].strip()
+    return ""
+
+
+def refresh_host_desktop_cache() -> None:
+    """Rebuilds the XDG desktop database and KDE Plasma 6's `ksycoca6` cache."""
+    if shutil.which("update-desktop-database"):
+        subprocess.run(
+            ["update-desktop-database", str(HOST_APPS_DIR)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    if shutil.which("kbuildsycoca6"):
+        subprocess.run(
+            ["kbuildsycoca6"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+
+def list_guest_applications(cfg: RuntimeConfig) -> None:
+    """Lists exportable GUI applications inside the guest."""
+    transport = create_control_transport(cfg)
+    apps = transport.list_apps()
+    print(f"{'APP ID (Use this for export)':<45} | {'APPLICATION NAME'}")
+    print("-" * 80)
+    for app_id, name in apps:
+        print(f"{app_id:<45} | {name}")
+
+
+def export_applications(cfg: RuntimeConfig, app_ids: list[str]) -> None:
+    """Deploys guest scripts, exports .desktop files + icons, and enables the host tray service."""
+    transport = create_control_transport(cfg)
+    transport.ensure_guest_scripts(force=True)
+    script_hash = compute_guest_scripts_hash(cfg.vsock_control_port)
+    print(f"[OK] Synced guest scripts ({script_hash}, mode={cfg.mode}) for '{cfg.vm_label}'")
+
+    HOST_APPS_DIR.mkdir(parents=True, exist_ok=True)
+    exported_count = 0
+
+    for app_id in app_ids:
+        clean_id = app_id[:-8] if app_id.endswith(".desktop") else app_id
+        raw_text = transport.read_desktop_file(clean_id)
+        if not raw_text:
+            print(f"[WARN] Application '{clean_id}' not found on '{cfg.vm_label}'. Skipping.", file=sys.stderr)
+            continue
+
+        raw_icon = extract_desktop_entry_icon(raw_text)
+        resolved_icon = save_guest_icon(cfg, transport, raw_icon)
+        transformed_text = transform_desktop_file(raw_text, cfg, resolved_icon)
+
+        target_file = HOST_APPS_DIR / f"wayport-{cfg.vm_slug}-{clean_id}.desktop"
+        target_file.write_text(transformed_text, encoding="utf-8")
+        target_file.chmod(0o644)
+        print(f"[OK] Exported '{clean_id}' -> {target_file}")
+        exported_count += 1
+
+    if exported_count > 0:
+        setup_host_tray_systemd_service(cfg)
+        print(f"[OK] Enabled & restarted host tray service: {cfg.systemd_service_name}")
+        refresh_host_desktop_cache()
+        print("[DONE] Desktop launcher cache updated.")
+
+
+def remove_applications(cfg: RuntimeConfig, app_ids: list[str], remove_all: bool) -> None:
+    """Removes exported .desktop files, icons, and (when --all) the per-VM tray service."""
+    prefixes = {cfg.vm_slug, cfg.vm_label}
+    if cfg.vm_target:
+        prefixes.add(cfg.vm_target)
+
+    if remove_all:
+        for prefix in prefixes:
+            for path in HOST_APPS_DIR.glob(f"wayport-{prefix}-*.desktop"):
+                path.unlink(missing_ok=True)
+                print(f"[REMOVED] {path}")
+            if HOST_ICONS_DIR.exists():
+                for path in HOST_ICONS_DIR.glob(f"wayport-{prefix}-*"):
+                    path.unlink(missing_ok=True)
+                    print(f"[REMOVED] {path}")
+        service_path = HOST_SYSTEMD_USER_DIR / cfg.systemd_service_name
+        if service_path.exists():
+            if shutil.which("systemctl"):
+                subprocess.run(["systemctl", "--user", "disable", "--now", cfg.systemd_service_name], check=False)
+            service_path.unlink(missing_ok=True)
+            print(f"[REMOVED] {service_path}")
+    else:
+        for app_id in app_ids:
+            clean_id = app_id[:-8] if app_id.endswith(".desktop") else app_id
+            for prefix in prefixes:
+                target_file = HOST_APPS_DIR / f"wayport-{prefix}-{clean_id}.desktop"
+                if target_file.exists():
+                    target_file.unlink()
+                    print(f"[REMOVED] {target_file}")
+
+    refresh_host_desktop_cache()
+    print("[DONE] Desktop launcher cache updated.")
+
+
+def install_guest_components(cfg: RuntimeConfig, local: bool) -> None:
+    """
+    Installs guest scripts (`wayport-wrapper`, `wayport-tray-agent`, `wayport-daemon`)
+    and enables `wayport-guest.service` either locally (inside the VM) or remotely via SSH.
+    """
+    if local:
+        bin_dir = Path(os.path.expanduser(GUEST_BIN_DIR))
+        bin_dir.mkdir(parents=True, exist_ok=True)
+
+        files = {
+            GUEST_WRAPPER_NAME: render_guest_wrapper(),
+            GUEST_TRAY_AGENT_NAME: render_guest_tray_agent(),
+            GUEST_CONTROL_DAEMON_NAME: render_guest_control_daemon(cfg.vsock_control_port),
+        }
+        for name, content in files.items():
+            target = bin_dir / name
+            target.write_text(content, encoding="utf-8")
+            target.chmod(0o755)
+            print(f"[OK] Installed {target}")
+
+        unit_dir = Path.home() / ".config" / "systemd" / "user"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        unit_path = unit_dir / GUEST_SYSTEMD_UNIT_NAME
+        unit_path.write_text(build_guest_daemon_systemd_unit(cfg.vsock_control_port), encoding="utf-8")
+        print(f"[OK] Wrote {unit_path}")
+
+        if shutil.which("systemctl"):
+            subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+            subprocess.run(["systemctl", "--user", "enable", "--now", GUEST_SYSTEMD_UNIT_NAME], check=False)
+            subprocess.run(["systemctl", "--user", "restart", GUEST_SYSTEMD_UNIT_NAME], check=False)
+            print(f"[OK] Enabled & started {GUEST_SYSTEMD_UNIT_NAME} (AF_VSOCK port {cfg.vsock_control_port})")
+        else:
+            print(f"[WARN] systemctl not found; start {bin_dir / GUEST_CONTROL_DAEMON_NAME} manually.")
+
+        if shutil.which("loginctl"):
+            user_name = os.environ.get("USER") or Path.home().name
+            subprocess.run(["loginctl", "enable-linger", user_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            chk = subprocess.run(
+                ["loginctl", "show-user", user_name, "-p", "Linger"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=False,
+            )
+            if "Linger=yes" in chk.stdout:
+                print(f"[OK] Enabled systemd linger for '{user_name}' (starts at boot without login)")
+            else:
+                print(
+                    f"[WARN] Could not enable systemd linger automatically for '{user_name}'. "
+                    f"Run `sudo loginctl enable-linger {user_name}` so {GUEST_SYSTEMD_UNIT_NAME} starts on VM boot without login."
+                )
+        return
+
+    if not cfg.vm_target:
+        raise TransportError(
+            "Remote `install-guest` requires --target user@host, or run `wayport install-guest --local` inside the VM."
+        )
+    ssh_transport = SSHControlTransport(cfg)
+    linger_ok = ssh_transport.deploy_guest_control_daemon()
+    print(
+        f"[OK] Installed guest scripts & enabled {GUEST_SYSTEMD_UNIT_NAME} on '{cfg.vm_target}' "
+        f"(AF_VSOCK control port {cfg.vsock_control_port})."
+    )
+    if linger_ok:
+        print("[OK] Enabled systemd linger on guest (daemon starts automatically on VM boot without login).")
+    else:
+        print(
+            "[WARN] Could not verify systemd linger on guest. "
+            "Run `sudo loginctl enable-linger \"$USER\"` inside the VM so the daemon starts on boot without login."
+        )
+    print("     You can now use pure socket mode without SSH: `wayport --mode vsock --cid <CID> list`")
+
+
+def run_doctor(cfg: RuntimeConfig) -> int:
+    """Checks host (and optional guest) prerequisites for the selected transport mode."""
+    print(f"wayport {__version__} doctor (mode={cfg.mode}, compression={cfg.compression}, no_gpu={cfg.no_gpu})")
+    print("-" * 72)
+
+    ok_all = True
+
+    def report(label: str, ok: bool, detail: str, optional: bool = False) -> None:
+        nonlocal ok_all
+        tag = "OK" if ok else ("WARN" if optional else "FAIL")
+        print(f"[{tag:<4}] {label:<28} {detail}")
+        if not ok and not optional:
+            ok_all = False
+
+    wp = shutil.which("waypipe")
+    wp_ver = ""
+    if wp:
+        res = subprocess.run([wp, "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
+        wp_ver = (res.stdout.splitlines()[0] if res.stdout else wp).strip()
+    report("Host waypipe", bool(wp), wp_ver or "missing (install waypipe)")
+
+    has_dbus = False
+    try:
+        import dbus  # noqa: F401
+        has_dbus = True
+    except Exception:
+        pass
+    report("Python dbus (tray daemon)", has_dbus, "installed" if has_dbus else "missing (install python3-dbus)", optional=True)
+
+    has_gi = False
+    try:
+        from gi.repository import GLib  # noqa: F401
+        has_gi = True
+    except Exception:
+        pass
+    report("PyGObject GLib (tray)", has_gi, "installed" if has_gi else "missing (install python3-gi)", optional=True)
+
+    if cfg.mode in ("hybrid", "vsock"):
+        has_af_vsock = hasattr(socket, "AF_VSOCK")
+        has_vhost = Path("/dev/vhost-vsock").exists()
+        report("Python socket.AF_VSOCK", has_af_vsock, "supported" if has_af_vsock else "not supported by Python build")
+        report("Host /dev/vhost-vsock", has_vhost, "present" if has_vhost else "missing (run: sudo modprobe vhost_vsock)")
+
+    if cfg.mode in ("hybrid", "ssh"):
+        ssh_bin = shutil.which("ssh")
+        report("OpenSSH client (ssh)", bool(ssh_bin), ssh_bin or "missing (install openssh-client)")
+
+    # Test guest connectivity if a target/CID was supplied
+    has_target = (cfg.mode == "vsock" and cfg.vsock_cid is not None) or (cfg.mode != "vsock" and bool(cfg.vm_target))
+    if has_target:
+        transport = create_control_transport(cfg)
+        guest_ok, guest_detail = transport.check_health()
+        report(f"Guest ({cfg.vm_label})", guest_ok, guest_detail)
+    else:
+        report("Target connectivity", True, "skipped (pass --target or --cid to test)", optional=True)
+
+    print("-" * 72)
+    print("Result:", "READY" if ok_all else "ISSUES DETECTED")
+    return 0 if ok_all else 1
+
+
+# ==============================================================================
+# 7. CLI Entrypoint
+# ==============================================================================
+
+def _add_common_transport_args(target_parser: argparse.ArgumentParser, *, suppress_defaults: bool = False) -> None:
+    default_val = argparse.SUPPRESS if suppress_defaults else None
+    target_parser.add_argument(
+        "-m",
+        "--mode",
+        choices=("hybrid", "vsock", "socket", "ssh"),
+        default=default_val,
+        help=f"Transport mode: hybrid (SSH control + VSOCK data), vsock/socket (pure VSOCK), ssh (pure SSH). Default: {DEFAULT_TRANSPORT_MODE}",
+    )
+    target_parser.add_argument(
+        "-t",
+        "--target",
+        dest="target",
+        default=default_val,
+        help="Remote SSH target (user@host) for hybrid/ssh modes, or optional label / vsock://<CID> in vsock mode",
+    )
+    target_parser.add_argument(
+        "--cid",
+        type=int,
+        default=default_val,
+        help="Guest AF_VSOCK CID (>= 3) for pure vsock/socket mode",
+    )
+    target_parser.add_argument(
+        "-c",
+        "--compression",
+        choices=VALID_COMPRESSIONS,
+        default=default_val,
+        help=f"Waypipe compression (default: {WAYPIPE_COMPRESSION_VSOCK} for hybrid/vsock, {WAYPIPE_COMPRESSION_SSH} for ssh)",
+    )
+    gpu_group = target_parser.add_mutually_exclusive_group()
+    gpu_group.add_argument("--no-gpu", dest="no_gpu", action="store_true", default=default_val, help="Pass --no-gpu to waypipe")
+    gpu_group.add_argument("--gpu", dest="no_gpu", action="store_false", default=default_val, help="Allow GPU/DMABUF transfers in waypipe")
+    target_parser.add_argument(
+        "--control-port",
+        type=int,
+        default=default_val,
+        help=f"Guest AF_VSOCK control RPC port for vsock mode (default: {VSOCK_CONTROL_PORT})",
+    )
+    target_parser.add_argument(
+        "--tray-port",
+        type=int,
+        default=default_val,
+        help=f"Host AF_VSOCK tray bridge port (default: {VSOCK_TRAY_PORT})",
+    )
+    target_parser.add_argument(
+        "--no-tray",
+        action="store_true",
+        default=argparse.SUPPRESS if suppress_defaults else False,
+        help="Do not auto-start or modify the host systemd tray service during `run`",
+    )
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="wayport",
+        description=(
+            "Seamless KVM & remote Linux application exporter, runner, System Tray "
+            "& Desktop Notification bridge for KDE Plasma 6 (Wayland)."
+        ),
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__} (scripts:{compute_guest_scripts_hash()})",
+    )
+    _add_common_transport_args(parser, suppress_defaults=False)
+
+    common_sub = argparse.ArgumentParser(add_help=False)
+    _add_common_transport_args(common_sub, suppress_defaults=True)
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("list", parents=[common_sub], help="List available GUI applications inside the guest")
+
+    export_parser = subparsers.add_parser("export", parents=[common_sub], help="Export applications and enable the host tray bridge")
+    export_parser.add_argument("apps", nargs="+", help="Application IDs to export (e.g. google-chrome org.kde.dolphin)")
+
+    run_parser = subparsers.add_parser("run", help="Run a guest command directly via waypipe")
+    run_parser.add_argument("cmd", nargs=argparse.REMAINDER, help="Guest command and arguments to run")
+
+    subparsers.add_parser("tray-daemon", parents=[common_sub], help="Run the host-side System Tray & Notification bridge daemon")
+
+    remove_parser = subparsers.add_parser("remove", parents=[common_sub], help="Remove exported applications from the host")
+    remove_parser.add_argument("apps", nargs="*", help="Application IDs to remove")
+    remove_parser.add_argument("--all", action="store_true", help="Remove all exported apps, icons, and tray service for this VM")
+
+    install_guest_parser = subparsers.add_parser(
+        "install-guest",
+        parents=[common_sub],
+        help="Install guest helper scripts and pure-VSOCK `wayport-guest.service`",
+    )
+    install_guest_parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Install locally inside the guest VM (no SSH required)",
+    )
+
+    subparsers.add_parser("doctor", parents=[common_sub], help="Check host & guest readiness for the selected transport mode")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+
+    require_target = args.command not in ("doctor", "install-guest")
+    if args.command == "install-guest" and not args.local:
+        require_target = True
+
+    try:
+        cfg = build_runtime_config(
+            mode=args.mode,
+            vm_target=args.target,
+            vsock_cid=args.cid,
+            compression=args.compression,
+            no_gpu=args.no_gpu,
+            tray_port=args.tray_port,
+            control_port=args.control_port,
+            require_target=require_target,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    try:
+        if args.command == "list":
+            list_guest_applications(cfg)
+            return 0
+        if args.command == "export":
+            export_applications(cfg, args.apps)
+            return 0
+        if args.command == "run":
+            cmd_tokens = list(args.cmd)
+            if cmd_tokens and cmd_tokens[0] == "--":
+                cmd_tokens = cmd_tokens[1:]
+            if not cmd_tokens:
+                parser.error("`run` requires a guest command.")
+            return run_guest_application(cfg, cmd_tokens, start_tray=not bool(getattr(args, "no_tray", False)))
+        if args.command == "tray-daemon":
+            run_host_tray_daemon(cfg)
+            return 0
+        if args.command == "remove":
+            if not args.all and not args.apps:
+                parser.error("Specify at least one app ID or use --all.")
+            remove_applications(cfg, args.apps, args.all)
+            return 0
+        if args.command == "install-guest":
+            install_guest_components(cfg, local=args.local)
+            return 0
+        if args.command == "doctor":
+            return run_doctor(cfg)
+    except BrokenPipeError:
+        return 0
+    except TransportError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    sys.exit(main())

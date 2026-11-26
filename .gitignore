@@ -221,3 +221,19 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Wayport project & local files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+*.sock
+*.stamp
+*.bak
+.local/
+temp_workdir/
+*.key
+*.pem
+
