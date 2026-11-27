@@ -224,6 +224,118 @@ def test_bridge_socket_pair_closes_fds(app):
     h_ext.close()
 
 
+def test_pump_socket_stream_flushes_trailing_prefix_without_deadlock(app):
+    """A Wayland packet ending in `b'z'` (prefix of zwp_idle_inhibit_manager_v1) must not stall."""
+    src_w, src_r = socket.socketpair()
+    dst_r, dst_w = socket.socketpair()
+    dst_r.settimeout(1.0)
+
+    t = threading.Thread(
+        target=app.pump_socket_stream,
+        args=(src_r, dst_w),
+        kwargs={"mask_idle_inhibit": True, "flush_timeout": 0.01},
+        daemon=True,
+    )
+    t.start()
+
+    # Keep src_w open (simulating a live roundtrip waiting for reply) and send bytes ending in 'z'
+    packet = b"\x01\x00\x00\x00hello_z"
+    src_w.sendall(packet)
+
+    received = bytearray()
+    while len(received) < len(packet):
+        chunk = dst_r.recv(1024)
+        assert chunk, "Unexpected EOF before receiving trailing 'z'"
+        received.extend(chunk)
+    assert bytes(received) == packet
+
+    src_w.shutdown(socket.SHUT_WR)
+    t.join(timeout=2.0)
+    assert not t.is_alive()
+    for s in (src_w, src_r, dst_r, dst_w):
+        s.close()
+
+
+def test_legacy_waypipe_protocol_masking_and_version_detection(app):
+    assert app.parse_waypipe_version("waypipe 0.8.6\n") == (0, 8, 6)
+    assert app.parse_waypipe_version("waypipe 0.11.2\nfeatures:\n  lz4: true\n") == (0, 11, 2)
+    assert app.parse_waypipe_version("unknown") is None
+
+    cfg = app.build_runtime_config(mode="vsock", vsock_cid=3, compression="none")
+    legacy_reps = app.build_stream_replacements(cfg, host_waypipe_version=(0, 8, 6))
+    modern_reps = app.build_stream_replacements(cfg, host_waypipe_version=(0, 11, 2))
+
+    assert len(modern_reps) == 1
+    assert len(legacy_reps) == 1 + len(app.LEGACY_WAYPIPE_PROTOCOL_MASKS)
+
+    # Framed wl_registry.global entries must be masked across chunk boundaries,
+    # while unframed plain text containing "wl_fixes" must remain untouched.
+    framed_edc = b"\x1c\x00\x00\x00ext_data_control_manager_v1\x00"
+    expected_edc = b"\x1c\x00\x00\x00ext_data_control_disabledv1\x00"
+    framed_fixes = b"\x09\x00\x00\x00wl_fixes\x00"
+    expected_fixes = b"\x09\x00\x00\x00wl_fix00\x00"
+    plain_text = b"clipboard says wl_fixes is cool"
+    payload = framed_edc + plain_text + framed_fixes
+
+    src_w, src_r = socket.socketpair()
+    dst_r, dst_w = socket.socketpair()
+    t = threading.Thread(
+        target=app.pump_socket_stream,
+        args=(src_r, dst_w),
+        kwargs={"replacements": legacy_reps, "chunk_size": 7},
+        daemon=True,
+    )
+    t.start()
+    src_w.sendall(payload)
+    src_w.shutdown(socket.SHUT_WR)
+
+    received = bytearray()
+    while True:
+        chunk = dst_r.recv(4096)
+        if not chunk:
+            break
+        received.extend(chunk)
+    t.join(timeout=2.0)
+
+    assert bytes(received) == expected_edc + plain_text + expected_fixes
+    for s in (src_w, src_r, dst_r, dst_w):
+        s.close()
+
+
+def test_vsock_session_handle_ignores_stdout_broken_pipe_and_reports_unexpected_eof(app, monkeypatch):
+    # 1. BrokenPipeError on host stdout must NOT terminate the VSOCK control session
+    c_sock, s_sock = socket.socketpair()
+
+    class BrokenStream:
+        def write(self, _text):
+            raise BrokenPipeError("pipe closed")
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(app.sys, "stdout", BrokenStream())
+    handle = app.VsockSessionHandle(c_sock, forward_output=True)
+    s_sock.sendall(b'{"event":"stdout","data":"hello\\n"}\n')
+    s_sock.sendall(b'{"event":"exit","code":0}\n')
+    assert handle.wait(timeout=2.0) == 0
+    assert handle.disconnect_reason is None
+    s_sock.close()
+
+    # 2. Abrupt EOF without exit event records disconnect_reason and returns non-zero
+    c_sock2, s_sock2 = socket.socketpair()
+    handle2 = app.VsockSessionHandle(c_sock2, forward_output=False)
+    s_sock2.close()
+    assert handle2.wait(timeout=2.0) == 1
+    assert handle2.disconnect_reason is not None
+    assert "EOF" in handle2.disconnect_reason
+
+
+def test_sigpipe_not_set_to_sig_dfl_in_entrypoint():
+    src = SCRIPT_PATH.read_text(encoding="utf-8")
+    assert "signal.SIG_DFL" not in src
+    assert "signal.signal(signal.SIGPIPE, signal.SIG_IGN)" in src
+
+
 # ------------------------------------------------------------------------------
 # 3. Desktop File Transformation & Exec Rewriting
 # ------------------------------------------------------------------------------
@@ -557,6 +669,7 @@ def test_guest_daemon_systemd_unit_and_linger_bootstrap(app, monkeypatch, tmp_pa
     assert "After=dbus.socket" in unit
     assert "After=default.target" not in unit
     assert "WantedBy=default.target" in unit
+    assert "TimeoutStopSec=5" in unit
     assert "--port 5055" in unit
 
     calls: list[list[str]] = []

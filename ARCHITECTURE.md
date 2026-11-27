@@ -1,6 +1,6 @@
 # `wayport` Architecture
 
-This document describes the internal architecture, transport modes, wire protocols, process lifecycle, and security model of `wayport` (`v0.2.1`).
+This document describes the internal architecture, transport modes, wire protocols, process lifecycle, and security model of `wayport` (`v0.2.2`).
 
 ---
 
@@ -182,21 +182,24 @@ In pure `ssh` mode over TCP/LAN/VPN/WAN (for physical remote Linux PCs, workstat
 * For bandwidth-constrained WAN links, `--compression zstd` significantly reduces wire traffic at modest CPU cost.
 * When targeting a **physical remote Linux PC** (rather than a KVM guest with `virtio_gpu`), `VULKAN_USE_LVP` can be set to `False` to let Vulkan applications use the remote machine's hardware GPU ICD; similarly, `ENABLE_SINGLETON_TAKEOVER` and `ENABLE_PORTAL_ROUTING` can be disabled if another user actively shares the same Linux account on the remote machine's physical display.
 
-### Boundary-Safe `zwp_idle_inhibit_manager_v1` Masking
+### Boundary-Safe `zwp_idle_inhibit_manager_v1` & Legacy Protocol Masking
 
-When `MASK_IDLE_INHIBIT = True` and `compression == "none"`, `pump_socket_stream()` inspects the Host → Guest Wayland stream (where `wl_registry.global` advertisements flow) and replaces the 27-byte ASCII interface name:
+When `compression == "none"`, `pump_socket_stream()` inspects the Host → Guest Wayland stream (where `wl_registry.global` advertisements flow):
 
-```text
-zwp_idle_inhibit_manager_v1  (27 bytes)
-            │
-            ▼
-zwp_idle_inhibit_disabledv1  (27 bytes, identical length & padding)
-```
+1. **Idle-inhibit masking (`MASK_IDLE_INHIBIT = True`):** Replaces the 27-byte ASCII interface name:
+   ```text
+   zwp_idle_inhibit_manager_v1  (27 bytes)
+               │
+               ▼
+   zwp_idle_inhibit_disabledv1  (27 bytes, identical length & padding)
+   ```
+2. **Legacy host `waypipe < 0.10` compatibility (`MASK_LEGACY_WAYPIPE_PROTOCOLS = True`):** When host `waypipe` is detected as legacy C `waypipe < 0.10` (e.g. `0.8.6` on Ubuntu 24.04) talking to a modern Rust `waypipe 0.10+/0.11+` guest, `pump_socket_stream()` also masks length-prefixed (`<uint32 len+1><name>\0`) `wl_registry.global` entries for newer protocols with FD/object tracking unknown to `0.8.x` (`ext_data_control_manager_v1`, `wp_color_manager_v1`, `xdg_toplevel_icon_manager_v1`, `wl_fixes`, `wp_linux_drm_syncobj_manager_v1`, `wp_security_context_manager_v1`, `ext_image_copy_capture_manager_v1`), preventing cross-version wire desynchronization.
 
-Because `recv()` may split that 27-byte string across two consecutive chunks, `pump_socket_stream()` retains only the **longest suffix of the current chunk that is a proper prefix** of `b"zwp_idle_inhibit_manager_v1"` (at most 26 bytes) in a `pending` carryover buffer:
+Because `recv()` may split a masked string across two consecutive chunks, `pump_socket_stream()` retains only the **longest suffix of the current chunk that is a proper prefix** of any active needle in a `pending` carryover buffer:
 * On normal chunks (99.999% of traffic), `keep == 0` and all bytes are forwarded immediately with **zero added latency**.
-* If the string spans arbitrary chunk boundaries (even 1 byte per `recv()`), it is always reassembled and masked accurately.
+* If a packet happens to end in a prefix byte (such as `0x7a` `'z'`), a short `select()` flush timeout (`STREAM_MASK_FLUSH_TIMEOUT_SEC = 0.005`, 5 ms) flushes `pending` immediately when no follow-up bytes arrive so synchronous Wayland roundtrips never stall.
 * On EOF, any buffered trailing prefix is flushed before `SHUT_WR`.
+* All socket writes use `SIGPIPE = SIG_IGN` and `MSG_NOSIGNAL` so peer-closed connections raise catchable `BrokenPipeError` instead of terminating the host bridge process.
 
 Both sockets in a bridged pair are closed deterministically once both pump threads finish via a thread-safe reference count, eliminating file descriptor leaks.
 
@@ -217,7 +220,7 @@ To support **100% headless KVM guests** (`sddm` disabled) and eliminate Electron
 When `ENABLE_PORTAL_ROUTING = True`:
 * Writes `~/.config/xdg-desktop-portal/portals.conf` routing `FileChooser` and `Settings` to `kde` while setting `Inhibit`, `Notification`, `Background`, and `GlobalShortcuts` to `none`.
 * Points `${XDG_RUNTIME_DIR}/wayland-host` to the active `waypipe` socket, updates `systemd --user` + D-Bus activation environments, and triggers a fast non-blocking restart (`systemctl --user restart --no-block`) with a short readiness poll (up to `1.0s`) so `plasma-xdg-desktop-portal-kde.service` renders native KDE `KFileWidget` dialogs on the host without delaying application startup.
-* On exit, `cleanup()` checks whether another active `waypipe` session exists (matching both basename and full path in `/proc/*/environ`) and re-points `wayland-host` to it, or restores `wayland-0` if it was the last session.
+* On exit, `cleanup()` checks whether another active `waypipe` session exists (scanning both `*waypipe*` and Rust `waypipe` `wayland-*` sockets while excluding symlinks and native `wayland-[0-9]*` sockets, and verifying `WAYPORT_SESSION=1` in `/proc/*/environ`) and re-points `wayland-host` to it, or restores `wayland-0` if it was the last session.
 
 ### Host Tray Service Isolation & Port-Conflict Safety
 
@@ -252,12 +255,12 @@ When `ENABLE_PORTAL_ROUTING = True`:
 Settings are merged in strictly defined precedence order:
 
 ```text
-1. CLI flags (--mode, --target, --cid, --compression, --no-gpu/--gpu, --control-port, --tray-port, --no-tray)
+1. CLI flags (--mode, --target, --cid, --compression, --no-gpu/--gpu, --control-port, --tray-port, --no-tray, --debug)
        │ overrides
 2. Environment variables (WAYPORT_MODE, WAYPORT_TARGET, WAYPORT_CID,
                           WAYPORT_COMPRESSION, WAYPORT_NO_GPU,
-                          WAYPORT_MASK_IDLE_INHIBIT, WAYPORT_CONTROL_PORT,
-                          WAYPORT_TRAY_PORT)
+                          WAYPORT_MASK_IDLE_INHIBIT, WAYPORT_MASK_LEGACY_WAYPIPE_PROTOCOLS,
+                          WAYPORT_CONTROL_PORT, WAYPORT_TRAY_PORT, WAYPORT_DEBUG)
        │ overrides
 3. Top-of-file USER CONFIGURATION constants in `wayport`
 ```

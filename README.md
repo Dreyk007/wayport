@@ -237,8 +237,10 @@ You can also override settings at runtime with environment variables or CLI flag
 | `WAYPORT_COMPRESSION` | `-c, --compression` | `none` (`vsock`/`hybrid`), `lz4` (`ssh`) | `waypipe` compression (`none`, `lz4`, `zstd`) |
 | `WAYPORT_NO_GPU` | `--no-gpu` / `--gpu` | `true` | Disable DMABUF forwarding in `waypipe` |
 | `WAYPORT_MASK_IDLE_INHIBIT` | *(config)* | `true` | Mask `zwp_idle_inhibit_manager_v1` when uncompressed |
+| `WAYPORT_MASK_LEGACY_WAYPIPE_PROTOCOLS` | *(config)* | `true` | Auto-mask incompatible 0.10+ Wayland globals when host runs legacy C `waypipe < 0.10` and uncompressed |
 | `WAYPORT_CONTROL_PORT` | `--control-port` | `5000` | Guest `AF_VSOCK` control RPC port (`vsock` mode) |
 | `WAYPORT_TRAY_PORT` | `--tray-port` | `5001` | Host `AF_VSOCK` tray bridge port (`hybrid`/`vsock`) |
+| `WAYPORT_DEBUG` | `--debug` | `false` | Enable verbose bridge/session diagnostic logging |
 | *(config: `AUTO_START_TRAY_ON_RUN`)* | `--no-tray` | `true` | Skip auto-starting/touching the host systemd tray service during `run` |
 
 ---

@@ -30,10 +30,12 @@ import json
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -43,7 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # ==============================================================================
 # 0. USER CONFIGURATION
@@ -67,6 +69,7 @@ ALLOW_VSOCK_SCRIPT_SYNC: bool = True
 
 # Socket stream bridge settings
 STREAM_CHUNK_SIZE: int = 262144  # 256 KiB
+STREAM_MASK_FLUSH_TIMEOUT_SEC: float = 0.005  # Max wait before flushing trailing prefix bytes
 
 # Waypipe transport defaults per mode ("none", "lz4", "zstd")
 WAYPIPE_COMPRESSION_VSOCK: str = "none"
@@ -74,6 +77,10 @@ WAYPIPE_COMPRESSION_SSH: str = "lz4"
 WAYPIPE_NO_GPU_VSOCK: bool = True
 WAYPIPE_NO_GPU_SSH: bool = True
 MASK_IDLE_INHIBIT: bool = True  # Masks zwp_idle_inhibit_manager_v1 (active when compression == "none")
+# Auto-mask newer 0.10+ Wayland protocols (ext_data_control, wp_color_manager, etc.)
+# when host runs legacy C waypipe < 0.10 and compression == "none"
+MASK_LEGACY_WAYPIPE_PROTOCOLS: bool = True
+DEBUG_LOGGING: bool = False  # Verbose session/bridge diagnostics (or set WAYPORT_DEBUG=1 / --debug)
 
 # SSH options (used in "hybrid" and "ssh" modes)
 SSH_CONNECT_TIMEOUT: int = 10
@@ -208,10 +215,72 @@ SCRIPT_ABS_PATH = str(Path(__file__).resolve())
 VMADDR_CID_ANY = getattr(socket, "VMADDR_CID_ANY", 0xFFFFFFFF)
 VMADDR_CID_LOCAL = getattr(socket, "VMADDR_CID_LOCAL", 1)
 VMADDR_CID_HOST = getattr(socket, "VMADDR_CID_HOST", 2)
+MSG_NOSIGNAL = getattr(socket, "MSG_NOSIGNAL", 0)
 
 IDLE_INHIBIT_NEEDLE = b"zwp_idle_inhibit_manager_v1"
 IDLE_INHIBIT_REPLACEMENT = b"zwp_idle_inhibit_disabledv1"
 assert len(IDLE_INHIBIT_NEEDLE) == len(IDLE_INHIBIT_REPLACEMENT)
+
+
+def _make_wayland_global_mask(interface: str, replacement: str) -> tuple[bytes, bytes]:
+    """Builds a length-prefixed Wayland wire string replacement for wl_registry.global."""
+    raw_in = interface.encode("ascii")
+    raw_out = replacement.encode("ascii")
+    assert len(raw_in) == len(raw_out)
+    hdr = struct.pack("<I", len(raw_in) + 1)
+    return hdr + raw_in + b"\x00", hdr + raw_out + b"\x00"
+
+
+# Protocols tracked by Rust waypipe 0.10+/0.11+ (with FDs or object state) that legacy
+# C waypipe 0.8.x does not know and would otherwise pass through untranslated, causing
+# wire desynchronization (e.g. `invalid method 2048` on ext_data_control_offer_v1).
+LEGACY_WAYPIPE_PROTOCOL_MASKS: tuple[tuple[bytes, bytes], ...] = (
+    _make_wayland_global_mask("ext_data_control_manager_v1", "ext_data_control_disabledv1"),
+    _make_wayland_global_mask("wp_color_manager_v1", "wp_color_disabledv1"),
+    _make_wayland_global_mask("xdg_toplevel_icon_manager_v1", "xdg_toplevel_icon_disabledv1"),
+    _make_wayland_global_mask("wl_fixes", "wl_fix00"),
+    _make_wayland_global_mask("wp_linux_drm_syncobj_manager_v1", "wp_linux_drm_syncobj_disabledv1"),
+    _make_wayland_global_mask("wp_security_context_manager_v1", "wp_security_context_disabledv1"),
+    _make_wayland_global_mask("ext_image_copy_capture_manager_v1", "ext_image_copy_capture_disabledv1"),
+)
+
+_HOST_WAYPIPE_VERSION_CACHE: tuple[bool, tuple[int, ...] | None] = (False, None)
+
+
+def parse_waypipe_version(raw_output: str) -> tuple[int, ...] | None:
+    """Extracts a semantic version tuple from `waypipe --version` output."""
+    match = re.search(r"\b(\d+)\.(\d+)(?:\.(\d+))?\b", raw_output or "")
+    if not match:
+        return None
+    parts = [int(match.group(1)), int(match.group(2))]
+    if match.group(3) is not None:
+        parts.append(int(match.group(3)))
+    return tuple(parts)
+
+
+def detect_host_waypipe_version(*, use_cache: bool = True) -> tuple[int, ...] | None:
+    """Detects the installed host `waypipe` version tuple, or None if unavailable."""
+    global _HOST_WAYPIPE_VERSION_CACHE
+    if use_cache and _HOST_WAYPIPE_VERSION_CACHE[0]:
+        return _HOST_WAYPIPE_VERSION_CACHE[1]
+    wp = shutil.which("waypipe")
+    ver: tuple[int, ...] | None = None
+    if wp:
+        try:
+            res = subprocess.run(
+                [wp, "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=3.0,
+                check=False,
+            )
+            ver = parse_waypipe_version(res.stdout)
+        except Exception:
+            ver = None
+    if use_cache:
+        _HOST_WAYPIPE_VERSION_CACHE = (True, ver)
+    return ver
 
 VALID_MODES = ("hybrid", "vsock", "ssh")
 MODE_ALIASES = {"socket": "vsock"}
@@ -243,6 +312,8 @@ class RuntimeConfig:
     vsock_tray_port: int
     compression_explicit: bool = False
     no_gpu_explicit: bool = False
+    mask_legacy_waypipe_protocols: bool = MASK_LEGACY_WAYPIPE_PROTOCOLS
+    debug: bool = DEBUG_LOGGING
 
     @property
     def systemd_service_name(self) -> str:
@@ -251,6 +322,10 @@ class RuntimeConfig:
     @property
     def effective_mask_idle_inhibit(self) -> bool:
         return self.mask_idle_inhibit and self.compression == "none"
+
+    @property
+    def effective_mask_legacy_protocols(self) -> bool:
+        return self.mask_legacy_waypipe_protocols and self.compression == "none"
 
     def cli_target_args(self) -> list[str]:
         """Builds canonical CLI flags to reproduce this config from .desktop or systemd."""
@@ -327,6 +402,8 @@ def build_runtime_config(
     tray_port: int | None = None,
     control_port: int | None = None,
     mask_idle_inhibit: bool | None = None,
+    mask_legacy_waypipe_protocols: bool | None = None,
+    debug: bool | None = None,
     require_target: bool = True,
 ) -> RuntimeConfig:
     """Merges CLI flags, WAYPORT_* environment variables, and top-of-file defaults."""
@@ -409,6 +486,16 @@ def build_runtime_config(
         if mask_idle_inhibit is not None
         else _parse_bool_env("WAYPORT_MASK_IDLE_INHIBIT", MASK_IDLE_INHIBIT)
     )
+    resolved_legacy_mask = (
+        mask_legacy_waypipe_protocols
+        if mask_legacy_waypipe_protocols is not None
+        else _parse_bool_env("WAYPORT_MASK_LEGACY_WAYPIPE_PROTOCOLS", MASK_LEGACY_WAYPIPE_PROTOCOLS)
+    )
+    resolved_debug = (
+        debug
+        if debug is not None
+        else _parse_bool_env("WAYPORT_DEBUG", DEBUG_LOGGING)
+    )
     resolved_ctrl_port = (
         control_port
         if control_port is not None
@@ -433,6 +520,8 @@ def build_runtime_config(
         vsock_tray_port=resolved_tray_port,
         compression_explicit=comp_explicit,
         no_gpu_explicit=no_gpu_explicit,
+        mask_legacy_waypipe_protocols=resolved_legacy_mask,
+        debug=resolved_debug,
     )
 
 
@@ -713,11 +802,15 @@ is_waypipe_sock_in_use() {
     local sock_path="$1"
     local sock_base
     sock_base="$(basename "$sock_path")"
-    local pdir
+    local pdir pid
     for pdir in /proc/[0-9]*; do
+        pid="${pdir#/proc/}"
+        [ "$pid" = "$$" ] && continue
+        [ "$pid" = "$WP_SERVER_PID" ] && continue
         [ -r "${pdir}/environ" ] || continue
-        if grep -Fqz "WAYLAND_DISPLAY=${sock_base}" "${pdir}/environ" 2>/dev/null || \
-           grep -Fqz "WAYLAND_DISPLAY=${sock_path}" "${pdir}/environ" 2>/dev/null; then
+        if grep -Fqz "WAYPORT_SESSION=1" "${pdir}/environ" 2>/dev/null && \
+           { grep -Fqz "WAYLAND_DISPLAY=${sock_base}" "${pdir}/environ" 2>/dev/null || \
+             grep -Fqz "WAYLAND_DISPLAY=${sock_path}" "${pdir}/environ" 2>/dev/null; }; then
             return 0
         fi
     done
@@ -733,9 +826,14 @@ cleanup() {
         CURRENT_TARGET="$(readlink "${XDG_RUNTIME_DIR}/wayland-host" 2>/dev/null || true)"
         if [ "$CURRENT_TARGET" = "$WP_SOCK" ]; then
             OTHER_SOCK=""
-            for cand in "${XDG_RUNTIME_DIR}"/*waypipe*; do
+            for cand in "${XDG_RUNTIME_DIR}"/*waypipe* "${XDG_RUNTIME_DIR}"/wayland-*; do
                 [ -S "$cand" ] || continue
+                [ -L "$cand" ] && continue
                 [ "$cand" = "$WP_SOCK" ] && continue
+                cand_base="$(basename "$cand")"
+                case "$cand_base" in
+                    wayland-host|wayland-[0-9]|wayland-[0-9][0-9]) continue ;;
+                esac
                 if is_waypipe_sock_in_use "$cand"; then
                     OTHER_SOCK="$cand"
                     break
@@ -788,7 +886,18 @@ cleanup() {
         kill -KILL "$WP_SERVER_PID" 2>/dev/null || true
     fi
 }
-trap cleanup EXIT INT TERM
+
+# shellcheck disable=SC2329  # Invoked via INT/TERM trap
+on_signal() {
+    local sig="$1"
+    local code="$2"
+    echo "[WAYPORT-WRAPPER] Received SIG${sig} (instance=${WAYPORT_INSTANCE_ID}, app_pid=${APP_MAIN_PID:-none}); cleaning up." >&2
+    cleanup
+    exit "$code"
+}
+trap cleanup EXIT
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
 
 # 5. Architecture-aware Vulkan Lavapipe ICD override
 if [ "$VULKAN_USE_LVP" -eq 1 ]; then
@@ -864,11 +973,11 @@ fi
 
 wait "$APP_MAIN_PID"
 APP_RC=$?
+END_TS="$(date +%s)"
 if [ -n "$NUDGE_PID" ]; then
     kill "$NUDGE_PID" 2>/dev/null || true
     wait "$NUDGE_PID" 2>/dev/null || true
 fi
-END_TS="$(date +%s)"
 
 # 9. Keepalive loop for fast-forking CLI launchers (e.g. code, antigravity)
 if [ $((END_TS - START_TS)) -lt "$FAST_FORK_THRESHOLD_SEC" ]; then
@@ -1879,22 +1988,41 @@ def main() -> None:
         finally:
             GLib.idle_add(loop.quit)
 
-    def handle_term(_signum, _frame) -> None:
-        GLib.idle_add(loop.quit)
+    def request_quit() -> bool:
+        if loop.is_running():
+            loop.quit()
+        return False
 
-    signal.signal(signal.SIGTERM, handle_term)
-    signal.signal(signal.SIGINT, handle_term)
+    if hasattr(GLib, "unix_signal_add"):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, request_quit)
+    else:
+        def handle_term(_signum, _frame) -> None:
+            GLib.idle_add(request_quit)
+
+        signal.signal(signal.SIGTERM, handle_term)
+        signal.signal(signal.SIGINT, handle_term)
 
     threading.Thread(target=reader_worker, daemon=True).start()
     try:
         loop.run()
     finally:
-        for obj in (vsock_file_w, vsock_file_r, vsock_sock):
-            if obj is not None:
-                try:
-                    obj.close()
-                except Exception:
-                    pass
+        # Shut down the raw socket first so reader_worker unblocks immediately;
+        # never call vsock_file_r.close() first (it would deadlock on BufferedReader's lock).
+        if vsock_sock is not None:
+            try:
+                vsock_sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                vsock_sock.close()
+            except OSError:
+                pass
+        if vsock_file_w is not None:
+            try:
+                vsock_file_w.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
@@ -2005,11 +2133,17 @@ def find_icon_file(icon_name: str) -> tuple[str, bytes] | None:
     return None
 
 
+MSG_NOSIGNAL = getattr(socket, "MSG_NOSIGNAL", 0)
+
+
 def _send_json(conn: socket.socket, lock: threading.Lock, obj: dict) -> bool:
     data = (json.dumps(obj, separators=(",", ":")) + "\n").encode("utf-8")
     with lock:
         try:
-            conn.sendall(data)
+            if MSG_NOSIGNAL:
+                conn.sendall(data, MSG_NOSIGNAL)
+            else:
+                conn.sendall(data)
             return True
         except OSError:
             return False
@@ -2153,6 +2287,7 @@ def handle_client(conn: socket.socket, peer_cid: int | None = None) -> None:
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
+            log_msg(f"run started pid={proc.pid} vsock_port={vsock_port} cmd={cmd_tokens[0]!r}")
             _send_json(conn, send_lock, {"ok": True, "event": "started", "pid": proc.pid})
 
             t_out = threading.Thread(target=_stream_pipe, args=(proc.stdout, "stdout", conn, send_lock), daemon=True)
@@ -2162,24 +2297,29 @@ def handle_client(conn: socket.socket, peer_cid: int | None = None) -> None:
 
             # Watch for host disconnect or explicit cancel message
             def watch_host() -> None:
+                reason = "host_eof"
                 try:
                     for line in reader:
                         if not line:
+                            reason = "host_eof"
                             break
                         try:
                             msg = json.loads(line)
                             if msg.get("op") == "terminate":
-                                _terminate_proc(proc)
+                                reason = "terminate_op"
                                 break
                         except Exception:
                             pass
-                except Exception:
-                    pass
+                except Exception as exc:
+                    reason = f"read_error:{exc}"
                 finally:
+                    if proc.poll() is None:
+                        log_msg(f"run watch_host terminating pid={proc.pid} vsock_port={vsock_port} reason={reason}")
                     _terminate_proc(proc)
 
             threading.Thread(target=watch_host, daemon=True).start()
             rc = proc.wait()
+            log_msg(f"run exited pid={proc.pid} vsock_port={vsock_port} code={rc}")
             t_out.join(timeout=1.0)
             t_err.join(timeout=1.0)
             _send_json(conn, send_lock, {"event": "exit", "code": rc})
@@ -2195,22 +2335,28 @@ def handle_client(conn: socket.socket, peer_cid: int | None = None) -> None:
                 stderr=subprocess.PIPE,
                 start_new_session=True,
             )
+            log_msg(f"start_tray started pid={proc.pid} vsock_port={tray_port}")
             _send_json(conn, send_lock, {"ok": True, "event": "started", "pid": proc.pid})
             t_err = threading.Thread(target=_stream_pipe, args=(proc.stderr, "stderr", conn, send_lock), daemon=True)
             t_err.start()
 
             def watch_tray_host() -> None:
+                reason = "host_eof"
                 try:
                     for line in reader:
                         if not line:
+                            reason = "host_eof"
                             break
-                except Exception:
-                    pass
+                except Exception as exc:
+                    reason = f"read_error:{exc}"
                 finally:
+                    if proc.poll() is None:
+                        log_msg(f"start_tray watch_host terminating pid={proc.pid} reason={reason}")
                     _terminate_proc(proc)
 
             threading.Thread(target=watch_tray_host, daemon=True).start()
             rc = proc.wait()
+            log_msg(f"start_tray exited pid={proc.pid} code={rc}")
             t_err.join(timeout=1.0)
             _send_json(conn, send_lock, {"event": "exit", "code": rc})
             return
@@ -2331,6 +2477,14 @@ def compute_guest_scripts_hash(control_port: int = VSOCK_CONTROL_PORT) -> str:
 # 2. Boundary-Safe Socket Stream Bridge (AF_VSOCK <-> AF_UNIX & AF_UNIX <-> AF_UNIX)
 # ==============================================================================
 
+def _sendall_nosig(sock: socket.socket, data: bytes) -> None:
+    """Sends all bytes without triggering SIGPIPE on Linux."""
+    if MSG_NOSIGNAL:
+        sock.sendall(data, MSG_NOSIGNAL)
+    else:
+        sock.sendall(data)
+
+
 def longest_matching_prefix_len(data: bytes, needle: bytes) -> int:
     """Returns the length of the longest suffix of `data` that is a proper prefix of `needle`."""
     max_k = min(len(data), len(needle) - 1)
@@ -2340,49 +2494,114 @@ def longest_matching_prefix_len(data: bytes, needle: bytes) -> int:
     return 0
 
 
+def longest_matching_prefix_len_any(data: bytes, needles: tuple[bytes, ...]) -> int:
+    """Returns the max proper-prefix match length across all `needles` at the end of `data`."""
+    best = 0
+    for needle in needles:
+        k = longest_matching_prefix_len(data, needle)
+        if k > best:
+            best = k
+    return best
+
+
+def build_stream_replacements(
+    cfg: RuntimeConfig,
+    *,
+    host_waypipe_version: tuple[int, ...] | None = None,
+) -> tuple[tuple[bytes, bytes], ...]:
+    """Builds the active Host -> Guest Wayland wire replacements for uncompressed streams."""
+    pairs: list[tuple[bytes, bytes]] = []
+    if cfg.effective_mask_idle_inhibit:
+        pairs.append((IDLE_INHIBIT_NEEDLE, IDLE_INHIBIT_REPLACEMENT))
+    if cfg.effective_mask_legacy_protocols:
+        ver = host_waypipe_version if host_waypipe_version is not None else detect_host_waypipe_version()
+        if ver is not None and ver < (0, 10):
+            pairs.extend(LEGACY_WAYPIPE_PROTOCOL_MASKS)
+    return tuple(pairs)
+
+
 def pump_socket_stream(
     src: socket.socket,
     dst: socket.socket,
     *,
     mask_idle_inhibit: bool = False,
+    replacements: tuple[tuple[bytes, bytes], ...] | None = None,
     chunk_size: int = STREAM_CHUNK_SIZE,
+    flush_timeout: float = STREAM_MASK_FLUSH_TIMEOUT_SEC,
+    debug_label: str = "",
+    debug: bool = False,
 ) -> None:
     """
     Forwards bytes from `src` to `dst` until EOF.
-    When `mask_idle_inhibit=True`, replaces the 27-byte Wayland global name
-    `zwp_idle_inhibit_manager_v1` with `zwp_idle_inhibit_disabledv1`, even if
-    the string is split across arbitrary `recv()` chunk boundaries.
+    When `replacements` (or `mask_idle_inhibit=True`) are configured, replaces
+    each equal-length Wayland global name safely across arbitrary `recv()` chunk
+    boundaries and flushes any held-back partial prefix after `flush_timeout`
+    seconds of inactivity so roundtrip packets ending in a prefix byte never stall.
     """
+    if replacements is None:
+        active_replacements: tuple[tuple[bytes, bytes], ...] = (
+            ((IDLE_INHIBIT_NEEDLE, IDLE_INHIBIT_REPLACEMENT),) if mask_idle_inhibit else ()
+        )
+    else:
+        active_replacements = replacements
+    needles = tuple(n for n, _ in active_replacements)
+
     pending = b""
+    total_bytes = 0
+    err_note = ""
     try:
         while True:
+            if pending:
+                # If no follow-up bytes arrive within flush_timeout, this trailing prefix
+                # is the end of an unrelated Wayland packet rather than a split global name.
+                try:
+                    ready, _, _ = select.select([src], [], [], flush_timeout)
+                except (OSError, ValueError):
+                    ready = [src]
+                if not ready:
+                    _sendall_nosig(dst, pending)
+                    total_bytes += len(pending)
+                    pending = b""
+
             chunk = src.recv(chunk_size)
             if not chunk:
                 if pending:
-                    dst.sendall(pending)
+                    _sendall_nosig(dst, pending)
+                    total_bytes += len(pending)
                     pending = b""
                 break
 
-            if mask_idle_inhibit:
+            if active_replacements:
                 buf = pending + chunk
-                if IDLE_INHIBIT_NEEDLE in buf:
-                    buf = buf.replace(IDLE_INHIBIT_NEEDLE, IDLE_INHIBIT_REPLACEMENT)
-                keep = longest_matching_prefix_len(buf, IDLE_INHIBIT_NEEDLE)
+                for needle, replacement in active_replacements:
+                    if needle in buf:
+                        buf = buf.replace(needle, replacement)
+                keep = longest_matching_prefix_len_any(buf, needles)
                 if keep:
                     to_send, pending = buf[:-keep], buf[-keep:]
                 else:
                     to_send, pending = buf, b""
                 if to_send:
-                    dst.sendall(to_send)
+                    _sendall_nosig(dst, to_send)
+                    total_bytes += len(to_send)
             else:
-                dst.sendall(chunk)
-    except OSError:
-        pass
+                _sendall_nosig(dst, chunk)
+                total_bytes += len(chunk)
+    except OSError as exc:
+        err_note = f" ({type(exc).__name__}: {exc})"
     finally:
         try:
             dst.shutdown(socket.SHUT_WR)
         except OSError:
             pass
+        if debug and debug_label:
+            try:
+                print(
+                    f"[WAYPORT-DEBUG] bridge {debug_label} ended after {total_bytes}B{err_note}",
+                    file=sys.stderr,
+                )
+            except OSError:
+                pass
 
 
 def bridge_socket_pair(
@@ -2390,7 +2609,10 @@ def bridge_socket_pair(
     host_conn: socket.socket,
     *,
     mask_idle_inhibit: bool = False,
+    replacements: tuple[tuple[bytes, bytes], ...] | None = None,
     chunk_size: int = STREAM_CHUNK_SIZE,
+    debug_id: int = 0,
+    debug: bool = False,
 ) -> tuple[threading.Thread, threading.Thread]:
     """
     Starts bidirectional pumping between `guest_conn` and `host_conn` and closes
@@ -2399,9 +2621,23 @@ def bridge_socket_pair(
     state_lock = threading.Lock()
     remaining = [2]
 
-    def run_direction(src: socket.socket, dst: socket.socket, mask: bool) -> None:
+    def run_direction(
+        src: socket.socket,
+        dst: socket.socket,
+        mask: bool,
+        dir_replacements: tuple[tuple[bytes, bytes], ...] | None,
+        label: str,
+    ) -> None:
         try:
-            pump_socket_stream(src, dst, mask_idle_inhibit=mask, chunk_size=chunk_size)
+            pump_socket_stream(
+                src,
+                dst,
+                mask_idle_inhibit=mask,
+                replacements=dir_replacements,
+                chunk_size=chunk_size,
+                debug_label=label,
+                debug=debug,
+            )
         finally:
             should_close = False
             with state_lock:
@@ -2415,8 +2651,16 @@ def bridge_socket_pair(
                     except OSError:
                         pass
 
-    t_g2h = threading.Thread(target=run_direction, args=(guest_conn, host_conn, False), daemon=True)
-    t_h2g = threading.Thread(target=run_direction, args=(host_conn, guest_conn, mask_idle_inhibit), daemon=True)
+    t_g2h = threading.Thread(
+        target=run_direction,
+        args=(guest_conn, host_conn, False, (), f"#{debug_id} G->H"),
+        daemon=True,
+    )
+    t_h2g = threading.Thread(
+        target=run_direction,
+        args=(host_conn, guest_conn, mask_idle_inhibit, replacements, f"#{debug_id} H->G"),
+        daemon=True,
+    )
     t_g2h.start()
     t_h2g.start()
     return t_g2h, t_h2g
@@ -2427,33 +2671,53 @@ def accept_and_bridge_loop(
     target_unix_sock_path: str,
     *,
     mask_idle_inhibit: bool = False,
+    replacements: tuple[tuple[bytes, bytes], ...] | None = None,
     chunk_size: int = STREAM_CHUNK_SIZE,
+    debug: bool = False,
 ) -> None:
     """
     Accepts connections on `listener_sock` (AF_VSOCK or AF_UNIX) and bridges
     each connection to the host `waypipe client` Unix socket.
     """
+    conn_seq = 0
     while True:
         try:
             incoming_conn, _ = listener_sock.accept()
         except OSError:
             break
 
+        conn_seq += 1
         try:
             unix_conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             unix_conn.connect(target_unix_sock_path)
-        except OSError:
+        except OSError as exc:
+            try:
+                print(
+                    f"[WAYPORT-WARN] Bridge conn #{conn_seq} failed to connect to host waypipe client socket: {exc}",
+                    file=sys.stderr,
+                )
+            except OSError:
+                pass
             try:
                 incoming_conn.close()
             except OSError:
                 pass
             continue
 
+        if debug:
+            try:
+                print(f"[WAYPORT-DEBUG] Bridge accepted conn #{conn_seq}", file=sys.stderr)
+            except OSError:
+                pass
+
         bridge_socket_pair(
             incoming_conn,
             unix_conn,
             mask_idle_inhibit=mask_idle_inhibit,
+            replacements=replacements,
             chunk_size=chunk_size,
+            debug_id=conn_seq,
+            debug=debug,
         )
 
 
@@ -2591,11 +2855,28 @@ class VsockSessionHandle(ManagedProcessHandle):
         self._sock = sock
         self._forward_output = forward_output
         self._exit_code: int | None = None
+        self._terminate_requested = False
+        self._disconnect_reason: str | None = None
         self._done = threading.Event()
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._reader_thread.start()
 
+    @property
+    def disconnect_reason(self) -> str | None:
+        return self._disconnect_reason
+
+    def _safe_write_stream(self, stream, text: str) -> None:
+        if not self._forward_output or not text:
+            return
+        try:
+            stream.write(text)
+            stream.flush()
+        except OSError:
+            # Never abort the remote VSOCK control session because local stdout/stderr closed.
+            self._forward_output = False
+
     def _read_loop(self) -> None:
+        saw_exit = False
         try:
             with self._sock.makefile("r", encoding="utf-8", errors="replace") as reader:
                 for raw_line in reader:
@@ -2607,24 +2888,29 @@ class VsockSessionHandle(ManagedProcessHandle):
                     except json.JSONDecodeError:
                         continue
                     ev = msg.get("event")
-                    if ev == "stdout" and self._forward_output:
-                        sys.stdout.write(msg.get("data", ""))
-                        sys.stdout.flush()
-                    elif ev == "stderr" and self._forward_output:
-                        sys.stderr.write(msg.get("data", ""))
-                        sys.stderr.flush()
+                    if ev == "stdout":
+                        self._safe_write_stream(sys.stdout, msg.get("data", ""))
+                    elif ev == "stderr":
+                        self._safe_write_stream(sys.stderr, msg.get("data", ""))
                     elif ev == "exit":
                         self._exit_code = int(msg.get("code", 0))
+                        saw_exit = True
                         break
                     elif msg.get("ok") is False:
-                        sys.stderr.write(f"[ERROR] Guest daemon error: {msg.get('error', 'unknown')}\n")
+                        err = str(msg.get("error", "unknown"))
+                        self._safe_write_stream(sys.stderr, f"[ERROR] Guest daemon error: {err}\n")
+                        self._disconnect_reason = f"guest daemon error: {err}"
                         self._exit_code = 1
+                        saw_exit = True
                         break
-        except OSError:
-            pass
+            if not saw_exit and not self._terminate_requested:
+                self._disconnect_reason = "VSOCK control socket closed unexpectedly (EOF without exit event)"
+        except OSError as exc:
+            if not self._terminate_requested:
+                self._disconnect_reason = f"VSOCK control socket I/O error: {exc}"
         finally:
             if self._exit_code is None:
-                self._exit_code = 0
+                self._exit_code = 1 if self._disconnect_reason else 0
             self._done.set()
             try:
                 self._sock.close()
@@ -2635,8 +2921,9 @@ class VsockSessionHandle(ManagedProcessHandle):
         return self._exit_code if self._done.is_set() else None
 
     def terminate(self) -> None:
+        self._terminate_requested = True
         try:
-            self._sock.sendall(b'{"op":"terminate"}\n')
+            _sendall_nosig(self._sock, b'{"op":"terminate"}\n')
         except OSError:
             pass
         try:
@@ -2649,6 +2936,7 @@ class VsockSessionHandle(ManagedProcessHandle):
         return self._exit_code if self._done.is_set() else None
 
     def kill(self) -> None:
+        self._terminate_requested = True
         try:
             self._sock.close()
         except OSError:
@@ -3066,13 +3354,28 @@ def run_guest_application(cfg: RuntimeConfig, cmd_tokens: list[str], *, start_tr
 
     try:
         _wait_for_waypipe_client_socket(waypipe_sock_path, client_proc)
+        stream_replacements = build_stream_replacements(cfg)
+
+        if cfg.debug:
+            wp_ver = detect_host_waypipe_version()
+            print(
+                f"[WAYPORT-DEBUG] run start mode={cfg.mode} host_waypipe={wp_ver} "
+                f"comp={cfg.compression} no_gpu={cfg.no_gpu} masks={len(stream_replacements)} "
+                f"cmd={[executable, *app_args]!r}",
+                file=sys.stderr,
+            )
 
         if cfg.mode in ("hybrid", "vsock"):
             listener_sock, vsock_port = create_vsock_listener()
+            if cfg.debug:
+                print(
+                    f"[WAYPORT-DEBUG] Listening on host AF_VSOCK port {vsock_port} -> {waypipe_sock_path}",
+                    file=sys.stderr,
+                )
             threading.Thread(
                 target=accept_and_bridge_loop,
                 args=(listener_sock, str(waypipe_sock_path)),
-                kwargs={"mask_idle_inhibit": cfg.effective_mask_idle_inhibit},
+                kwargs={"replacements": stream_replacements, "debug": cfg.debug},
                 daemon=True,
             ).start()
 
@@ -3101,13 +3404,13 @@ def run_guest_application(cfg: RuntimeConfig, cmd_tokens: list[str], *, start_tr
         else:
             # Pure SSH mode: forward a unique remote Unix socket to host proxy or waypipe client
             local_forward_target = waypipe_sock_path
-            if cfg.effective_mask_idle_inhibit:
+            if stream_replacements:
                 proxy_sock_path = runtime_dir / f"wayport-proxy-{os.getpid()}-{session_token}.sock"
                 listener_sock = create_unix_listener(proxy_sock_path)
                 threading.Thread(
                     target=accept_and_bridge_loop,
                     args=(listener_sock, str(waypipe_sock_path)),
-                    kwargs={"mask_idle_inhibit": True},
+                    kwargs={"replacements": stream_replacements, "debug": cfg.debug},
                     daemon=True,
                 ).start()
                 local_forward_target = proxy_sock_path
@@ -3138,8 +3441,28 @@ def run_guest_application(cfg: RuntimeConfig, cmd_tokens: list[str], *, start_tr
                 break
             time.sleep(0.05)
 
-        rc = guest_handle.poll()
-        return int(rc) if rc is not None else 0
+        guest_rc = guest_handle.poll()
+        client_rc = client_handle.poll()
+        if not stop_event.is_set():
+            if client_rc is not None and guest_rc is None:
+                print(
+                    f"[WAYPORT-WARN] Host waypipe client exited unexpectedly (code={client_rc}) "
+                    "while guest application was running; terminating guest session.",
+                    file=sys.stderr,
+                )
+            if isinstance(guest_handle, VsockSessionHandle) and guest_handle.disconnect_reason:
+                print(
+                    f"[WAYPORT-WARN] Guest VSOCK session ended unexpectedly: {guest_handle.disconnect_reason}",
+                    file=sys.stderr,
+                )
+        if cfg.debug:
+            print(
+                f"[WAYPORT-DEBUG] run loop ended stop={stop_event.is_set()} "
+                f"guest_rc={guest_rc} client_rc={client_rc}",
+                file=sys.stderr,
+            )
+
+        return int(guest_rc) if guest_rc is not None else (int(client_rc) if client_rc is not None else 0)
     finally:
         signal.signal(signal.SIGTERM, prev_sigterm)
         signal.signal(signal.SIGINT, prev_sigint)
@@ -3542,7 +3865,7 @@ def run_host_tray_daemon(cfg: RuntimeConfig) -> None:
                     return
                 try:
                     if isinstance(writer, socket.socket):
-                        writer.sendall(line)
+                        _sendall_nosig(writer, line)
                     else:
                         writer.write(line)
                         writer.flush()
@@ -3729,13 +4052,23 @@ def run_host_tray_daemon(cfg: RuntimeConfig) -> None:
     manager = HostTrayBridgeManager()
     loop = GLib.MainLoop()
 
-    def handle_stop(_signum, _frame) -> None:
+    def request_stop() -> bool:
         manager.stop_event.set()
-        GLib.idle_add(manager.clear_all_items)
-        GLib.idle_add(loop.quit)
+        manager.clear_all_items()
+        if loop.is_running():
+            loop.quit()
+        return False
 
-    signal.signal(signal.SIGTERM, handle_stop)
-    signal.signal(signal.SIGINT, handle_stop)
+    if hasattr(GLib, "unix_signal_add"):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, request_stop)
+    else:
+        def handle_stop(_signum, _frame) -> None:
+            manager.stop_event.set()
+            GLib.idle_add(request_stop)
+
+        signal.signal(signal.SIGTERM, handle_stop)
+        signal.signal(signal.SIGINT, handle_stop)
 
     threading.Thread(target=manager.run_worker, daemon=True).start()
     try:
@@ -3759,6 +4092,7 @@ def build_guest_daemon_systemd_unit(control_port: int = VSOCK_CONTROL_PORT) -> s
         "Type=simple\n"
         "Environment=PYTHONUNBUFFERED=1\n"
         f"ExecStart=%h/.local/bin/{GUEST_CONTROL_DAEMON_NAME} --port {int(control_port)}\n"
+        "TimeoutStopSec=5\n"
         "Restart=always\n"
         "RestartSec=2\n\n"
         "[Install]\n"
@@ -3784,6 +4118,7 @@ def setup_host_tray_systemd_service(cfg: RuntimeConfig) -> None:
         "Type=simple\n"
         "Environment=PYTHONUNBUFFERED=1\n"
         f"ExecStart={exec_start}\n"
+        "TimeoutStopSec=5\n"
         "Restart=always\n"
         f"RestartSec={int(TRAY_RECONNECT_DELAY_SEC)}\n\n"
         "[Install]\n"
@@ -4185,10 +4520,19 @@ def run_doctor(cfg: RuntimeConfig) -> int:
 
     wp = shutil.which("waypipe")
     wp_ver = ""
+    wp_parsed: tuple[int, ...] | None = None
     if wp:
         res = subprocess.run([wp, "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False)
         wp_ver = (res.stdout.splitlines()[0] if res.stdout else wp).strip()
+        wp_parsed = parse_waypipe_version(wp_ver)
     report("Host waypipe", bool(wp), wp_ver or "missing (install waypipe)")
+    if wp_parsed is not None and wp_parsed < (0, 10):
+        mask_note = (
+            "legacy C waypipe (<0.10): incompatible 0.10+ protocols auto-masked when compression=none"
+            if cfg.effective_mask_legacy_protocols
+            else "legacy C waypipe (<0.10): consider compression=none or upgrading host waypipe to 0.11+"
+        )
+        report("Waypipe protocol compat", True, mask_note, optional=True)
 
     has_dbus = False
     try:
@@ -4284,6 +4628,12 @@ def _add_common_transport_args(target_parser: argparse.ArgumentParser, *, suppre
         default=argparse.SUPPRESS if suppress_defaults else False,
         help="Do not auto-start or modify the host systemd tray service during `run`",
     )
+    target_parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=default_val,
+        help="Enable verbose bridge/session diagnostic logging (or set WAYPORT_DEBUG=1)",
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -4352,6 +4702,7 @@ def main(argv: list[str] | None = None) -> int:
             no_gpu=args.no_gpu,
             tray_port=args.tray_port,
             control_port=args.control_port,
+            debug=args.debug if getattr(args, "debug", None) is True else None,
             require_target=require_target,
         )
     except ValueError as exc:
@@ -4393,6 +4744,19 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # Never use SIG_DFL for SIGPIPE: wayport bridges live AF_VSOCK/AF_UNIX sockets
+    # across threads, and writing to a peer-closed socket must raise catchable
+    # BrokenPipeError instead of terminating the entire process and killing all apps.
     if hasattr(signal, "SIGPIPE"):
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-    sys.exit(main())
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+    rc = main()
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.close(devnull)
+        except (OSError, ValueError):
+            pass
+    sys.exit(rc)
